@@ -158,11 +158,11 @@ class SongDedupApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final lightScheme = ColorScheme.fromSeed(
-      seedColor: const Color(0xFF6C4DFF),
+      seedColor: const Color(0xFF616161),
       brightness: Brightness.light,
     );
     final darkScheme = ColorScheme.fromSeed(
-      seedColor: const Color(0xFF6C4DFF),
+      seedColor: const Color(0xFF616161),
       brightness: Brightness.dark,
     );
 

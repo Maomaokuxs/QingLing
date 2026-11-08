@@ -3,312 +3,488 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../main.dart';
+import 'about_screen.dart';
+import 'lrc_dedup_screen.dart';
+import '../widgets/minimal_ui.dart';
 import '../services/ignore_service.dart';
 
 class SettingsScreen extends StatelessWidget {
-  const SettingsScreen({super.key});
+  /// 由主屏传入：在设置页内触发导出清单 / 目录统计（逻辑在主屏，原样保留）
+  final VoidCallback? onExportList;
+  final VoidCallback? onShowDirStats;
+
+  const SettingsScreen({super.key, this.onExportList, this.onShowDirStats});
 
   @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('设置', style: TextStyle(fontWeight: FontWeight.bold)),
-      ),
-      body: ListView(
-        children: [
-          _SectionHeader(title: '扫描设置'),
-          ValueListenableBuilder<bool>(
-                      valueListenable: scanAllDirsNotifier,
-                      builder: (context, all, _) =>
-                          ValueListenableBuilder<List<String>>(
-                        valueListenable: scanDirsNotifier,
-                        builder: (context, dirs, _) => ListTile(
-                          leading: const Icon(Icons.folder_open_rounded),
-                          title: const Text('扫描范围'),
-                          subtitle: Text(
-                            all
-                                ? '全部目录'
-                                : (dirs.isEmpty
-                                    ? '未勾选任何目录'
-                                    : '仅扫描：${dirs.join('、')}'),
-                            maxLines: 3,
-                            overflow: TextOverflow.ellipsis,
-                            style:
-                                TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
-                          ),
-                          trailing: TextButton(
-                            onPressed: () => _showScanDirDialog(context),
-                            child: const Text('设置'),
-                          ),
-                          onTap: () => _showScanDirDialog(context),
-                        ),
-                      ),
+      body: SafeArea(
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 16, 4),
+              child: Row(
+                children: [
+                  MinimalIconButton(
+                    icon: Icons.arrow_back_rounded,
+                    tooltip: '返回',
+                    size: 38,
+                    iconSize: 19,
+                    onPressed: () => Navigator.pop(context),
+                  ),
+                  const SizedBox(width: 8),
+                  const Text(
+                    '设置',
+                    style: TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 5,
                     ),
-          ValueListenableBuilder<int>(
-                      valueListenable: keepBestNotifier,
-                      builder: (context, keepN, _) => ListTile(
-                        leading: const Icon(Icons.playlist_add_check_rounded),
-                        title: const Text('每组保留最佳'),
-                        subtitle: Text(
-                          '自动勾选时，每组保留 $keepN 个音质最好的版本',
-                          style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
-                        ),
-                        trailing: SegmentedButton<int>(
-                          segments: const [
-                            ButtonSegment(
-                              value: 1,
-                              label: Text('1', style: TextStyle(fontSize: 12)),
-                            ),
-                            ButtonSegment(
-                              value: 2,
-                              label: Text('2', style: TextStyle(fontSize: 12)),
-                            ),
-                            ButtonSegment(
-                              value: 3,
-                              label: Text('3', style: TextStyle(fontSize: 12)),
-                            ),
-                          ],
-                          selected: {keepN},
-                          onSelectionChanged: (s) => keepBestNotifier.value = s.first,
-                          showSelectedIcon: false,
-                          style: const ButtonStyle(
-                            visualDensity: VisualDensity.compact,
-                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                          ),
-                        ),
-                      ),
-                    ),
-          ValueListenableBuilder<String>(
-                      valueListenable: keepRuleNotifier,
-                      builder: (context, rule, _) =>
-                          ValueListenableBuilder<String>(
-                        valueListenable: keepDirNotifier,
-                        builder: (context, dir, _) => ListTile(
-                          leading: const Icon(Icons.rule_rounded),
-                          title: const Text('保留规则'),
-                          subtitle: Text(
-                            rule == 'quality'
-                                ? '按音质分保留最好的版本'
-                                : rule == 'lossless'
-                                    ? '优先保留无损格式（FLAC/WAV），再按音质'
-                                    : (dir.isEmpty
-                                        ? '优先保留指定目录（未设置目录）'
-                                        : '优先保留目录：$dir'),
-                            style: TextStyle(
-                                fontSize: 12, color: scheme.onSurfaceVariant),
-                          ),
-                          trailing: _M3Dropdown<String>(
-                            value: rule,
-                            options: const {
-                              'quality': '音质优先',
-                              'lossless': '优先无损',
-                              'dir': '优先目录',
-                            },
-                            onChanged: (r) async {
-                              keepRuleNotifier.value = r;
-                              if (r == 'dir') {
-                                final d = await FilePicker.platform
-                                    .getDirectoryPath();
-                                if (d != null) keepDirNotifier.value = d;
-                              }
-                            },
-                          ),
-                          onTap: rule == 'dir'
-                              ? () async {
-                                  final d = await FilePicker.platform
-                                      .getDirectoryPath();
-                                  if (d != null) keepDirNotifier.value = d;
-                                }
-                              : null,
-                        ),
-                      ),
-                    ),
-          ValueListenableBuilder<Set<String>>(
-                      valueListenable: IgnoreService.ignored,
-                      builder: (context, ignored, _) => ListTile(
-                        leading: const Icon(Icons.visibility_off_rounded),
-                        title: const Text('忽略的分组'),
-                        subtitle: Text(
-                          ignored.isEmpty
-                              ? '无，被忽略的分组不再出现在扫描结果中'
-                              : '${ignored.length} 组被忽略，不再出现在扫描结果中',
-                          style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
-                        ),
-                        trailing: TextButton(
-                          onPressed: ignored.isEmpty
-                              ? null
-                              : () => _confirmClearIgnored(context),
-                          child: const Text('清空'),
-                        ),
-                      ),
-                    ),
-          ValueListenableBuilder<bool>(
-                      valueListenable: autoScanNotifier,
-                      builder: (context, enabled, _) =>
-                          ValueListenableBuilder<int>(
-                        valueListenable: autoScanDaysNotifier,
-                        builder: (context, days, _) => SwitchListTile(
-                          secondary: const Icon(Icons.schedule_rounded),
-                          title: const Text('自动扫描'),
-                          subtitle: Text(
-                            enabled
-                                ? '已开启：启动时若超过 $days 天未扫描则自动扫描'
-                                : '已关闭：仅手动扫描',
-                            style: TextStyle(
-                                fontSize: 12, color: scheme.onSurfaceVariant),
-                          ),
-                          value: enabled,
-                          onChanged: (v) =>
-                              autoScanNotifier.value = v,
-                        ),
-                      ),
-                    ),
-          ValueListenableBuilder<bool>(
-                      valueListenable: autoScanNotifier,
-                      builder: (context, enabled, _) {
-                        if (!enabled) return const SizedBox.shrink();
-                        return ValueListenableBuilder<int>(
-                          valueListenable: autoScanDaysNotifier,
-                          builder: (context, days, _) => ListTile(
-                            leading: const Icon(Icons.timelapse_rounded),
-                            title: const Text('扫描间隔'),
-                            trailing: SegmentedButton<int>(
-                              segments: const [
-                                ButtonSegment(
-                                  value: 7,
-                                  label: Text('7天',
-                                      style: TextStyle(fontSize: 12)),
-                                ),
-                                ButtonSegment(
-                                  value: 14,
-                                  label: Text('14天',
-                                      style: TextStyle(fontSize: 12)),
-                                ),
-                                ButtonSegment(
-                                  value: 30,
-                                  label: Text('30天',
-                                      style: TextStyle(fontSize: 12)),
-                                ),
-                              ],
-                              selected: {days},
-                              onSelectionChanged: (sel) =>
-                                  autoScanDaysNotifier.value =
-                                      sel.first,
-                              showSelectedIcon: false,
-                              style: const ButtonStyle(
-                                visualDensity: VisualDensity.compact,
-                                tapTargetSize:
-                                    MaterialTapTargetSize.shrinkWrap,
-                              ),
-                            ),
-                          ),
-                        );
-                      },
-                    ),
-          _SectionHeader(title: '识别设置'),
-          ValueListenableBuilder<bool>(
-                      valueListenable: fingerprintEnabledNotifier,
-                      builder: (context, enabled, _) => SwitchListTile(
-                        title: const Text('文件指纹匹配'),
-                        subtitle: Text(
-                          enabled
-                              ? '已开启：识别文件名不同但内容相同的副本，扫描稍慢'
-                              : '已关闭：跳过文件内容比对，扫描更快',
-                          style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
-                        ),
-                        value: enabled,
-                        onChanged: (v) => fingerprintEnabledNotifier.value = v,
-                        secondary: const Icon(Icons.fingerprint_rounded),
-                      ),
-                    ),
-          ValueListenableBuilder<bool>(
-                      valueListenable: crossLingualEnabledNotifier,
-                      builder: (context, enabled, _) => SwitchListTile(
-                        title: const Text('跨语言版本匹配'),
-                        subtitle: Text(
-                          enabled
-                              ? '已开启：用声学指纹找伴奏相同、语言不同的版本，扫描明显变慢'
-                              : '已关闭：跳过跨语言声学比对，扫描更快',
-                          style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
-                        ),
-                        value: enabled,
-                        onChanged: (v) => crossLingualEnabledNotifier.value = v,
-                        secondary: const Icon(Icons.translate_rounded),
-                      ),
-                    ),
-          _SectionHeader(title: '回收站'),
-          ValueListenableBuilder<int>(
-                      valueListenable: trashRetentionDaysNotifier,
-                      builder: (context, days, _) => ListTile(
-                        leading: const Icon(Icons.auto_delete_rounded),
-                        title: const Text('回收站自动清理'),
-                        subtitle: Text(
-                          days == 0
-                              ? '永不自动清理，手动清空回收站'
-                              : '超过 $days 天的回收站记录自动删除',
-                          style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
-                        ),
-                        trailing: _M3Dropdown<int>(
-                          value: days,
-                          options: const {
-                            0: '永不',
-                            7: '7天',
-                            14: '14天',
-                            30: '30天',
-                          },
-                          onChanged: (v) =>
-                              trashRetentionDaysNotifier.value = v,
-                        ),
-                      ),
-                    ),
-          _SectionHeader(title: '缓存'),
-          const _CacheTile(),
-          _SectionHeader(title: '外观'),
-          ValueListenableBuilder<ThemeMode>(
-                      valueListenable: themeModeNotifier,
-                      builder: (context, mode, _) => ListTile(
-                        leading: Icon(switch (mode) {
-                          ThemeMode.light => Icons.light_mode_rounded,
-                          ThemeMode.dark => Icons.dark_mode_rounded,
-                          ThemeMode.system => Icons.brightness_auto_rounded,
-                        }),
-                        title: const Text('昼夜模式'),
-                        trailing: SegmentedButton<ThemeMode>(
-                          segments: const [
-                            ButtonSegment(
-                              value: ThemeMode.system,
-                              label: Text('自动', style: TextStyle(fontSize: 12)),
-                            ),
-                            ButtonSegment(
-                              value: ThemeMode.light,
-                              label: Text('浅色', style: TextStyle(fontSize: 12)),
-                            ),
-                            ButtonSegment(
-                              value: ThemeMode.dark,
-                              label: Text('深色', style: TextStyle(fontSize: 12)),
-                            ),
-                          ],
-                          selected: {mode},
-                          onSelectionChanged: (s) => themeModeNotifier.value = s.first,
-                          showSelectedIcon: false,
-                          style: const ButtonStyle(
-                            visualDensity: VisualDensity.compact,
-                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                          ),
-                        ),
-                      ),
-                    ),
+                  ),
                 ],
+              ),
+            ),
+            Expanded(
+              child: ListView(
+                padding: const EdgeInsets.only(bottom: 24),
+                children: [
+                  _SectionHeader(title: '扫描设置'),
+                  ValueListenableBuilder<bool>(
+                    valueListenable: autoScanNotifier,
+                    builder: (context, autoOn, _) => _MinimalCard(
+                      children: [
+                        _scanDirRow(context),
+                        _keepBestRow(),
+                        _keepRuleRow(context),
+                        _ignoredRow(context),
+                        _autoScanRow(autoOn),
+                        if (autoOn) _autoScanDaysRow(),
+                      ],
+                    ),
+                  ),
+                  _SectionHeader(title: '识别设置'),
+                  _MinimalCard(children: [
+                    _fingerprintRow(),
+                    _crossLingualRow(),
+                  ]),
+                  _SectionHeader(title: '回收站'),
+                  _MinimalCard(children: [
+                    _trashRetentionRow(),
+                  ]),
+                  _SectionHeader(title: '缓存'),
+                  _MinimalCard(children: [
+                    const _CacheTile(),
+                  ]),
+                  _SectionHeader(title: '工具'),
+                  _MinimalCard(children: [
+                    _Row(
+                      title: '导出清单',
+                      subtitle: '将重复清单导出为文本或播放列表并分享',
+                      onTap: onExportList == null
+                          ? null
+                          : () {
+                              Navigator.pop(context);
+                              onExportList!();
+                            },
+                    ),
+                    _Row(
+                      title: '目录统计',
+                      subtitle: '按目录查看重复文件的分布与占用空间',
+                      onTap: onShowDirStats == null
+                          ? null
+                          : () {
+                              Navigator.pop(context);
+                              onShowDirStats!();
+                            },
+                    ),
+                    _Row(
+                      title: '歌词去重',
+                      subtitle: '扫描并清理重复的歌词文件',
+                      onTap: () => Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                            builder: (_) => const LrcDedupScreen()),
+                      ),
+                    ),
+                  ]),
+                  _SectionHeader(title: '外观'),
+                  _MinimalCard(children: [
+                    _themeModeRow(),
+                  ]),
+                  _SectionHeader(title: '关于'),
+                  _MinimalCard(children: [
+                    _Row(
+                      title: '关于',
+                      subtitle: '版本 0.2.0 · 检查更新 · 开源许可',
+                      onTap: () => Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                            builder: (_) => const AboutScreen()),
+                      ),
+                    ),
+                  ]),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 扫描范围
+  Widget _scanDirRow(BuildContext context) {
+    return ValueListenableBuilder<bool>(
+      valueListenable: scanAllDirsNotifier,
+      builder: (context, all, _) => ValueListenableBuilder<List<String>>(
+        valueListenable: scanDirsNotifier,
+        builder: (context, dirs, _) => _Row(
+          title: '扫描范围',
+          subtitle: all
+              ? '全部目录'
+              : (dirs.isEmpty ? '未勾选任何目录' : '仅扫描：${dirs.join('、')}'),
+          trailing: _MinimalTextAction(
+            label: '设置',
+            onTap: () => _showScanDirDialog(context),
+          ),
+          onTap: () => _showScanDirDialog(context),
+        ),
+      ),
+    );
+  }
+
+  /// 每组保留最佳：1/2/3
+  Widget _keepBestRow() {
+    return ValueListenableBuilder<int>(
+      valueListenable: keepBestNotifier,
+      builder: (context, keepN, _) => _Row(
+        title: '每组保留最佳',
+        subtitle: '自动勾选时，每组保留 $keepN 个音质最好的版本',
+        trailing: MinimalSegmented<int>(
+          options: const {1: '1', 2: '2', 3: '3'},
+          value: keepN,
+          onChanged: (v) => keepBestNotifier.value = v,
+        ),
+      ),
+    );
+  }
+
+  /// 保留规则下拉
+  Widget _keepRuleRow(BuildContext context) {
+    return ValueListenableBuilder<String>(
+      valueListenable: keepRuleNotifier,
+      builder: (context, rule, _) => ValueListenableBuilder<String>(
+        valueListenable: keepDirNotifier,
+        builder: (context, dir, _) => _Row(
+          title: '保留规则',
+          subtitle: rule == 'quality'
+              ? '按音质分保留最好的版本'
+              : rule == 'lossless'
+                  ? '优先保留无损格式（FLAC/WAV），再按音质'
+                  : (dir.isEmpty
+                      ? '优先保留指定目录（未设置目录）'
+                      : '优先保留目录：$dir'),
+          trailing: _M3Dropdown<String>(
+            value: rule,
+            options: const {
+              'quality': '音质优先',
+              'lossless': '优先无损',
+              'dir': '优先目录',
+            },
+            onChanged: (r) async {
+              keepRuleNotifier.value = r;
+              if (r == 'dir') {
+                final d = await FilePicker.platform.getDirectoryPath();
+                if (d != null) keepDirNotifier.value = d;
+              }
+            },
+          ),
+          onTap: rule == 'dir'
+              ? () async {
+                  final d = await FilePicker.platform.getDirectoryPath();
+                  if (d != null) keepDirNotifier.value = d;
+                }
+              : null,
+        ),
+      ),
+    );
+  }
+
+  /// 忽略的分组
+  Widget _ignoredRow(BuildContext context) {
+    return ValueListenableBuilder<Set<String>>(
+      valueListenable: IgnoreService.ignored,
+      builder: (context, ignored, _) => _Row(
+        title: '忽略的分组',
+        subtitle: ignored.isEmpty
+            ? '无，被忽略的分组不再出现在扫描结果中'
+            : '${ignored.length} 组被忽略，不再出现在扫描结果中',
+        trailing: _MinimalTextAction(
+          label: '清空',
+          enabled: ignored.isNotEmpty,
+          onTap: () => _confirmClearIgnored(context),
+        ),
+      ),
+    );
+  }
+
+  /// 自动扫描开关
+  Widget _autoScanRow(bool enabled) {
+    return ValueListenableBuilder<int>(
+      valueListenable: autoScanDaysNotifier,
+      builder: (context, days, _) => _Row(
+        title: '自动扫描',
+        subtitle: enabled ? '已开启：启动时若超过 $days 天未扫描则自动扫描' : '已关闭：仅手动扫描',
+        trailing: MinimalSwitch(
+          value: enabled,
+          onChanged: (v) => autoScanNotifier.value = v,
+        ),
+      ),
+    );
+  }
+
+  /// 扫描间隔（仅自动扫描开启时显示）
+  Widget _autoScanDaysRow() {
+    return ValueListenableBuilder<int>(
+      valueListenable: autoScanDaysNotifier,
+      builder: (context, days, _) => _Row(
+        title: '扫描间隔',
+        trailing: MinimalSegmented<int>(
+          options: const {7: '7天', 14: '14天', 30: '30天'},
+          value: days,
+          onChanged: (v) => autoScanDaysNotifier.value = v,
+        ),
+      ),
+    );
+  }
+
+  /// 文件指纹开关
+  Widget _fingerprintRow() {
+    return ValueListenableBuilder<bool>(
+      valueListenable: fingerprintEnabledNotifier,
+      builder: (context, enabled, _) => _Row(
+        title: '文件指纹匹配',
+        subtitle: enabled ? '已开启：识别文件名不同但内容相同的副本，扫描稍慢' : '已关闭：跳过文件内容比对，扫描更快',
+        trailing: MinimalSwitch(
+          value: enabled,
+          onChanged: (v) => fingerprintEnabledNotifier.value = v,
+        ),
+      ),
+    );
+  }
+
+  /// 组内版本细分开关
+  Widget _crossLingualRow() {
+    return ValueListenableBuilder<bool>(
+      valueListenable: crossLingualEnabledNotifier,
+      builder: (context, enabled, _) => _Row(
+        title: '组内版本细分',
+        subtitle: enabled ? '已开启：同名组内用声学指纹区分不同版本/语言，不自动勾选，扫描明显变慢' : '已关闭：跳过组内声学比对，扫描更快',
+        trailing: MinimalSwitch(
+          value: enabled,
+          onChanged: (v) => crossLingualEnabledNotifier.value = v,
+        ),
+      ),
+    );
+  }
+
+  /// 回收站自动清理
+  Widget _trashRetentionRow() {
+    return ValueListenableBuilder<int>(
+      valueListenable: trashRetentionDaysNotifier,
+      builder: (context, days, _) => _Row(
+        title: '回收站自动清理',
+        subtitle: days == 0 ? '永不自动清理，手动清空回收站' : '超过 $days 天的回收站记录自动删除',
+        trailing: _M3Dropdown<int>(
+          value: days,
+          options: const {0: '永不', 7: '7天', 14: '14天', 30: '30天'},
+          onChanged: (v) => trashRetentionDaysNotifier.value = v,
+        ),
+      ),
+    );
+  }
+
+  /// 昼夜模式：下拉选择（跟随系统/浅色/深色）
+  Widget _themeModeRow() {
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: themeModeNotifier,
+      builder: (context, mode, _) => _Row(
+        title: '昼夜模式',
+        subtitle: '跟随系统 / 浅色 / 深色',
+        trailing: _M3Dropdown<ThemeMode>(
+          value: mode,
+          options: const {
+            ThemeMode.system: '跟随系统',
+            ThemeMode.light: '浅色',
+            ThemeMode.dark: '深色',
+          },
+          onChanged: (v) => themeModeNotifier.value = v,
+        ),
       ),
     );
   }
 }
 
+/// 极简设置行：标题 + 副标题 + 右侧控件，无前置图标。
+class _Row extends StatelessWidget {
+  final String title;
+  final String? subtitle;
+  final Widget? trailing;
+  final VoidCallback? onTap;
 
-/// 设置页分组标题
-/// 与应用 M3 风格统一的下拉框：tonal 圆角背景 + 统一字色，
-/// 替代裸 DropdownButton（无边框无底色，与圆角卡片/按钮不搭）。
+  const _Row({
+    required this.title,
+    this.subtitle,
+    this.trailing,
+    this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return InkWell(
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
+        child: Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(
+                        fontSize: 13, fontWeight: FontWeight.w600),
+                  ),
+                  if (subtitle != null) ...[
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitle!,
+                      style: TextStyle(
+                          fontSize: 10.5,
+                          color: scheme.onSurfaceVariant),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            if (trailing != null) ...[
+              const SizedBox(width: 10),
+              trailing!,
+            ] else if (onTap != null)
+              Icon(Icons.chevron_right_rounded,
+                  color: scheme.outline, size: 18),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 极简文字操作：小字按钮，用于"设置/清空"等行内操作。
+class _MinimalTextAction extends StatelessWidget {
+  final String label;
+  final VoidCallback onTap;
+  final bool enabled;
+
+  const _MinimalTextAction({
+    required this.label,
+    required this.onTap,
+    this.enabled = true,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return GestureDetector(
+      onTap: enabled ? onTap : null,
+      child: Opacity(
+        opacity: enabled ? 1 : 0.4,
+        child: Container(
+          padding:
+              const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: secondaryFillColor(context),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Text(
+            label,
+            style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: scheme.onSurfaceVariant),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 极简分组卡片：扁平白卡，1px 细边框，16px 圆角，行间细分隔线。
+class _MinimalCard extends StatelessWidget {
+  final List<Widget> children;
+
+  const _MinimalCard({required this.children});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final divided = <Widget>[];
+    for (var i = 0; i < children.length; i++) {
+      if (i > 0) {
+        divided.add(Divider(
+          height: 1,
+          thickness: 1,
+          indent: 14,
+          endIndent: 14,
+          color: scheme.outlineVariant.withValues(alpha: 0.5),
+        ));
+      }
+      divided.add(children[i]);
+    }
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 14),
+      decoration: BoxDecoration(
+        color: scheme.surface,
+        border: Border.all(color: scheme.outlineVariant, width: 1),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: divided,
+      ),
+    );
+  }
+}
+
+/// 设置页分组标题：眉题样式（小字/600/字间距/灰字）
+class _SectionHeader extends StatelessWidget {
+  final String title;
+  const _SectionHeader({required this.title});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 20, 16, 8),
+      child: Text(
+        title,
+        style: TextStyle(
+          fontSize: 11,
+          fontWeight: FontWeight.w600,
+          letterSpacing: 1.5,
+          color: scheme.onSurfaceVariant,
+        ),
+      ),
+    );
+  }
+}
+
+/// 与极简风统一的下拉框：透明底 + 1px 细边框。
+/// 点击弹出自定义极简菜单：白卡 + 1px 细边框 + 14px 圆角，
+/// 选中项黑字加粗 + 右侧对勾，无灰底高亮。
 class _M3Dropdown<T> extends StatelessWidget {
   final T value;
   final Map<T, String> options;
@@ -320,38 +496,96 @@ class _M3Dropdown<T> extends StatelessWidget {
     required this.onChanged,
   });
 
+  Future<void> _showMenu(BuildContext context) async {
+    final scheme = Theme.of(context).colorScheme;
+    final button = context.findRenderObject() as RenderBox?;
+    final overlay =
+        Navigator.of(context).overlay?.context.findRenderObject() as RenderBox?;
+    if (button == null || overlay == null) return;
+    final position = RelativeRect.fromRect(
+      Rect.fromPoints(
+        button.localToGlobal(Offset.zero, ancestor: overlay),
+        button.localToGlobal(button.size.bottomRight(Offset.zero),
+            ancestor: overlay),
+      ),
+      Offset.zero & overlay.size,
+    );
+    final entries = options.entries.toList();
+    final result = await showMenu<T>(
+      context: context,
+      position: position,
+      color: scheme.surface,
+      elevation: 8,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(14),
+        side: BorderSide(color: scheme.outlineVariant, width: 1),
+      ),
+      items: [
+        for (var i = 0; i < entries.length; i++) ...[
+          if (i > 0)
+            const PopupMenuDivider(height: 1),
+          PopupMenuItem<T>(
+            value: entries[i].key,
+            padding:
+                const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  entries[i].value,
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: entries[i].key == value
+                        ? FontWeight.w700
+                        : FontWeight.normal,
+                    color: entries[i].key == value
+                        ? scheme.onSurface
+                        : scheme.onSurfaceVariant,
+                  ),
+                ),
+                if (entries[i].key == value) ...[
+                  const SizedBox(width: 8),
+                  Icon(Icons.check_rounded,
+                      size: 14, color: scheme.onSurface),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ],
+    );
+    if (result != null) onChanged(result);
+  }
+
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12),
-      decoration: BoxDecoration(
-        color: scheme.secondaryContainer,
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: DropdownButton<T>(
-        value: value,
-        underline: const SizedBox.shrink(),
-        dropdownColor: scheme.surfaceContainerHighest,
-        borderRadius: BorderRadius.circular(12),
-        icon: Icon(Icons.arrow_drop_down_rounded,
-            color: scheme.onSecondaryContainer),
-        style: TextStyle(
-          fontSize: 13,
-          color: scheme.onSecondaryContainer,
-          fontWeight: FontWeight.w500,
+    return InkWell(
+      onTap: () => _showMenu(context),
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        padding:
+            const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          border: Border.all(color: scheme.outlineVariant, width: 1),
+          borderRadius: BorderRadius.circular(12),
         ),
-        items: [
-          for (final e in options.entries)
-            DropdownMenuItem(
-              value: e.key,
-              child: Text(e.value,
-                  style: TextStyle(color: scheme.onSurface)),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              options[value] ?? '',
+              style: TextStyle(
+                fontSize: 13,
+                color: scheme.onSurface,
+                fontWeight: FontWeight.w500,
+              ),
             ),
-        ],
-        onChanged: (v) {
-          if (v != null) onChanged(v);
-        },
+            const SizedBox(width: 2),
+            Icon(Icons.arrow_drop_down_rounded,
+                size: 18, color: scheme.onSurfaceVariant),
+          ],
+        ),
       ),
     );
   }
@@ -416,41 +650,16 @@ class _CacheTileState extends State<_CacheTile> {
 
   @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
     final b = _bytes;
-    return ListTile(
-      leading: const Icon(Icons.cached_rounded),
-      title: const Text('清除扫描缓存'),
-      subtitle: Text(
-        b == null
-            ? '正在统计…'
-            : '当前缓存 ${_fmt(b)}，清除后下次扫描变慢，结果不受影响',
-        style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
-      ),
-      trailing: TextButton(
-        onPressed: (b != null && b > 0) ? _confirmClear : null,
-        child: const Text('清除'),
-      ),
-    );
-  }
-}
-
-class _SectionHeader extends StatelessWidget {
-  final String title;
-  const _SectionHeader({required this.title});
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 20, 16, 8),
-      child: Text(
-        title,
-        style: TextStyle(
-          fontSize: 15,
-          fontWeight: FontWeight.bold,
-          color: scheme.primary,
-        ),
+    return _Row(
+      title: '清除扫描缓存',
+      subtitle: b == null
+          ? '正在统计…'
+          : '当前缓存 ${_fmt(b)}，清除后下次扫描变慢，结果不受影响',
+      trailing: _MinimalTextAction(
+        label: '清除',
+        enabled: b != null && b > 0,
+        onTap: _confirmClear,
       ),
     );
   }
@@ -534,7 +743,8 @@ Future<void> _showScanDirDialog(BuildContext context) async {
                           });
                         },
                 ),
-              for (final p in selected.where((e) => !presets.contains(e)).toList())
+              for (final p
+                  in selected.where((e) => !presets.contains(e)).toList())
                 CheckboxListTile(
                   title: Text(
                     p.split('/').last.isEmpty ? p : p.split('/').last,
@@ -558,8 +768,10 @@ Future<void> _showScanDirDialog(BuildContext context) async {
                             setState(() => selected.add(dir));
                           }
                         },
-                  icon: const Icon(Icons.create_new_folder_outlined, size: 18),
-                  label: const Text('添加目录…', style: TextStyle(fontSize: 13)),
+                  icon:
+                      const Icon(Icons.create_new_folder_outlined, size: 18),
+                  label:
+                      const Text('添加目录…', style: TextStyle(fontSize: 13)),
                 ),
               ),
             ],
@@ -573,8 +785,7 @@ Future<void> _showScanDirDialog(BuildContext context) async {
           FilledButton(
             onPressed: () {
               scanAllDirsNotifier.value = scanAll;
-              scanDirsNotifier.value =
-                  scanAll ? [] : selected.toList();
+              scanDirsNotifier.value = scanAll ? [] : selected.toList();
               Navigator.pop(ctx);
             },
             child: const Text('确定'),

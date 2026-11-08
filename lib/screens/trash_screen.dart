@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../services/trash_service.dart';
+import '../widgets/minimal_ui.dart';
 
 class TrashScreen extends StatefulWidget {
   const TrashScreen({super.key});
@@ -96,78 +97,150 @@ class _TrashScreenState extends State<TrashScreen> {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('回收站', style: TextStyle(fontWeight: FontWeight.bold)),
-        actions: [
+      body: SafeArea(
+        child: Column(
+          children: [
+            _buildTopBar(scheme),
+            Expanded(
+              child: loading
+                  ? const Center(child: CircularProgressIndicator())
+                  : records.isEmpty
+                      ? Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(Icons.recycling_rounded,
+                                  size: 48, color: scheme.outlineVariant),
+                              const SizedBox(height: 12),
+                              Text('回收站为空',
+                                  style: TextStyle(
+                                      fontSize: 14,
+                                      color: scheme.onSurfaceVariant)),
+                              const SizedBox(height: 4),
+                              Text('删除的歌曲将移至此处，可恢复或永久删除',
+                                  style: TextStyle(
+                                      fontSize: 12, color: scheme.outline)),
+                            ],
+                          ),
+                        )
+                      : ListView.builder(
+                          padding:
+                              const EdgeInsets.fromLTRB(16, 8, 16, 24),
+                          itemCount: records.length,
+                          itemBuilder: (c, i) {
+                            final r = records[i];
+                            return Container(
+                              margin: const EdgeInsets.only(bottom: 10),
+                              decoration: BoxDecoration(
+                                color: scheme.surface,
+                                border: Border.all(
+                                    color: scheme.outlineVariant, width: 1),
+                                borderRadius: BorderRadius.circular(20),
+                              ),
+                              child: Padding(
+                                padding: const EdgeInsets.fromLTRB(
+                                    16, 13, 12, 13),
+                                child: Row(
+                                  children: [
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            r.name,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: const TextStyle(
+                                                fontSize: 13.5,
+                                                fontWeight: FontWeight.w600),
+                                          ),
+                                          const SizedBox(height: 3),
+                                          Text(
+                                            '${TrashService.formatSize(r.size)} · ${_fmtTime(r.time)}',
+                                            style: TextStyle(
+                                              fontSize: 11,
+                                              color: scheme.onSurfaceVariant,
+                                            ),
+                                          ),
+                                          const SizedBox(height: 2),
+                                          Text(
+                                            r.originalPath,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: TextStyle(
+                                              fontSize: 10.5,
+                                              color: scheme.outline,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    MinimalIconButton(
+                                      icon: Icons.restore_rounded,
+                                      tooltip: '恢复',
+                                      size: 38,
+                                      iconSize: 18,
+                                      onPressed: () => _restore(r),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    MinimalIconButton(
+                                      icon: Icons.delete_forever_rounded,
+                                      tooltip: '永久删除',
+                                      size: 38,
+                                      iconSize: 18,
+                                      dark: true,
+                                      onPressed: () =>
+                                          _deletePermanent(r),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 顶栏：返回 + "回收站"大标题 + 清空按钮，与主屏风格统一
+  Widget _buildTopBar(ColorScheme scheme) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 16, 8),
+      child: Row(
+        children: [
+          MinimalIconButton(
+            icon: Icons.arrow_back_rounded,
+            tooltip: '返回',
+            size: 38,
+            iconSize: 19,
+            onPressed: () => Navigator.pop(context),
+          ),
+          const SizedBox(width: 8),
+          const Text(
+            '回收站',
+            style: TextStyle(
+              fontSize: 22,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 5,
+            ),
+          ),
+          const Spacer(),
           if (records.isNotEmpty)
-            IconButton(
-              tooltip: '清空',
-              icon: const Icon(Icons.delete_forever_rounded),
+            MinimalIconButton(
+              icon: Icons.delete_sweep_rounded,
+              tooltip: '清空回收站',
+              size: 38,
+              iconSize: 19,
+              dark: true,
               onPressed: _clearAll,
             ),
         ],
       ),
-      body: loading
-          ? const Center(child: CircularProgressIndicator())
-          : records.isEmpty
-              ? Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(Icons.recycling_rounded,
-                          size: 56, color: scheme.outline),
-                      const SizedBox(height: 12),
-                      Text('回收站为空',
-                          style: TextStyle(color: scheme.onSurfaceVariant)),
-                      const SizedBox(height: 4),
-                      Text('删除的歌曲将移至此处，可恢复或永久删除',
-                          style: TextStyle(fontSize: 12, color: scheme.outline)),
-                    ],
-                  ),
-                )
-              : ListView.separated(
-                  padding: const EdgeInsets.fromLTRB(12, 12, 12, 20),
-                  itemCount: records.length,
-                  separatorBuilder: (_, _) => const Divider(height: 1),
-                  itemBuilder: (c, i) {
-                    final r = records[i];
-                    return ListTile(
-                      leading: const Icon(Icons.music_note_rounded),
-                      title: Text(
-                        r.name,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontSize: 13),
-                      ),
-                      subtitle: Text(
-                        '${TrashService.formatSize(r.size)} · ${_fmtTime(r.time)}\n${r.originalPath}',
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 11,
-                          color: scheme.onSurfaceVariant,
-                        ),
-                      ),
-                      trailing: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          IconButton(
-                            tooltip: '恢复',
-                            icon: Icon(Icons.restore_rounded,
-                                color: Colors.green.shade700),
-                            onPressed: () => _restore(r),
-                          ),
-                          IconButton(
-                            tooltip: '永久删除',
-                            icon: Icon(Icons.delete_forever_rounded,
-                                color: Colors.red.shade700),
-                            onPressed: () => _deletePermanent(r),
-                          ),
-                        ],
-                      ),
-                    );
-                  },
-                ),
     );
   }
 }

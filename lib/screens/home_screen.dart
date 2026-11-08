@@ -9,7 +9,6 @@ import '../main.dart';
 import '../models/duplicate_group.dart';
 import '../models/song_file.dart';
 import '../services/media_tags_service.dart';
-import 'lrc_dedup_screen.dart';
 import '../services/audio_scanner.dart';
 import '../services/delete_service.dart';
 import '../services/ignore_service.dart';
@@ -18,6 +17,7 @@ import '../services/share_service.dart';
 import '../services/similarity_service.dart';
 import '../services/trash_service.dart';
 import '../widgets/group_card.dart';
+import '../widgets/minimal_ui.dart';
 import '../widgets/song_details_sheet.dart';
 import 'settings_screen.dart';
 import 'trash_screen.dart';
@@ -40,6 +40,8 @@ class _HomeScreenState extends State<HomeScreen> {
   int totalSongs = 0;
   String searchQuery = '';
   String sortBy = 'count'; // count | size | free
+  String reasonFilter = '全部'; // 全部 | 标题一致 | 不同版本
+  bool multiSelectMode = false; // 长按进入的多选模式
 
   // 试听
   final AudioPlayer _player = AudioPlayer();
@@ -338,9 +340,6 @@ class _HomeScreenState extends State<HomeScreen> {
         onChromaProgress: (done, total) {
           _updateScanProgress(done / (total == 0 ? 1 : total), '声学细分');
         },
-        onCrossLingualProgress: (done, total) {
-          _updateScanProgress(done / (total == 0 ? 1 : total), '跨语言匹配');
-        },
       ))
           // 跳过用户标记"不是重复"的分组
           .where((grp) => !IgnoreService.isIgnored(grp.key))
@@ -571,6 +570,7 @@ class _HomeScreenState extends State<HomeScreen> {
               searchQuery.isEmpty ||
               g.displayTitle.toLowerCase().contains(searchQuery.toLowerCase()),
         )
+        .where((g) => _matchReasonFilter(g.reason))
         .toList();
     if (sortBy == 'size') {
       list.sort((a, b) => b.totalSize.compareTo(a.totalSize));
@@ -580,6 +580,15 @@ class _HomeScreenState extends State<HomeScreen> {
       list.sort((a, b) => b.songs.length.compareTo(a.songs.length));
     }
     return list;
+  }
+
+  /// 筛选 chips 的原因映射：标题一致=同曲重复的各原因；不同版本=同名不同版本
+  bool _matchReasonFilter(String reason) {
+    return switch (reasonFilter) {
+      '标题一致' => reason != '同名不同版本',
+      '不同版本' => reason == '同名不同版本',
+      _ => true,
+    };
   }
 
   /// 该组已勾选（待删除）文件的总大小，即可释放空间。
@@ -593,6 +602,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _toggle(SongFile s, String key, bool v) {
     setState(() {
+      // 点复选框选中时自动进入多选模式；取消选中不退出
+      if (v && !multiSelectMode) multiSelectMode = true;
       final set = selections[key] ?? <String>{};
       if (v) {
         set.add(s.path);
@@ -601,6 +612,34 @@ class _HomeScreenState extends State<HomeScreen> {
       }
       selections[key] = set;
     });
+  }
+
+  /// 长按进入多选模式
+  void _enterMultiSelect() {
+    if (!multiSelectMode) setState(() => multiSelectMode = true);
+  }
+
+  void _exitMultiSelect() {
+    if (multiSelectMode) setState(() => multiSelectMode = false);
+  }
+
+  /// 智能选中：按保留规则自动勾选（原顶部按钮逻辑，原样保留）
+  void _smartSelect() {
+    setState(() {
+      final keepN = keepBestNotifier.value;
+      for (final g in groups) {
+        selections[g.key] = g.noAutoSelect
+            ? <String>{}
+            : QualityService.autoSelectByRule(g.songs, keepBest: keepN,
+                rule: keepRuleNotifier.value,
+                preferredDir: keepDirNotifier.value);
+      }
+    });
+  }
+
+  /// 清空选择（原顶部按钮逻辑，原样保留）
+  void _clearSelections() {
+    setState(() => selections.updateAll((k, v) => <String>{}));
   }
 
   Future<void> _ignoreGroup(DuplicateGroup g) async {
@@ -908,173 +947,377 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final list = filtered;
-    // 返回键：若在结果页则回到主界面（空状态），而非直接退出应用
+    // 返回键：多选模式先退出多选；结果页回到空状态，而非直接退出应用
     return PopScope(
-      canPop: groups.isEmpty,
+      canPop: groups.isEmpty && !multiSelectMode,
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop && groups.isNotEmpty) {
+        if (didPop) return;
+        if (multiSelectMode) {
+          _exitMultiSelect();
+        } else if (groups.isNotEmpty) {
           setState(() {
             groups = [];
             selections.clear();
+            multiSelectMode = false;
             status = '准备就绪';
           });
         }
       },
       child: Scaffold(
-        appBar: AppBar(
-          title: const Text('清聆', style: TextStyle(fontWeight: FontWeight.bold)),
-          actions: [
-            IconButton(
-              tooltip: '回收站',
-              icon: const Icon(Icons.recycling_rounded),
-              onPressed: () => Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => const TrashScreen()),
+        body: SafeArea(
+          child: Column(
+            children: [
+              _buildTopBar(scheme),
+              Expanded(
+                child: scanning
+                    ? _buildScanning()
+                    : groups.isEmpty
+                        ? _buildEmpty(scheme)
+                        : _buildResults(scheme, list),
               ),
-            ),
-            ValueListenableBuilder<ThemeMode>(
-              valueListenable: themeModeNotifier,
-              builder: (context, mode, _) {
-                final (icon, tip) = switch (mode) {
-                  ThemeMode.light => (
-                      Icons.light_mode_rounded,
-                      '浅色模式（点击切为深色）'
-                    ),
-                  ThemeMode.dark => (
-                      Icons.dark_mode_rounded,
-                      '深色模式（点击切为跟随系统）'
-                    ),
-                  ThemeMode.system => (
-                      Icons.brightness_auto_rounded,
-                      '跟随系统（点击切为浅色）'
-                    ),
-                };
-                return IconButton(
-                  tooltip: tip,
-                  icon: Icon(icon),
-                  onPressed: () {
-                    themeModeNotifier.value = switch (mode) {
-                      ThemeMode.system => ThemeMode.light,
-                      ThemeMode.light => ThemeMode.dark,
-                      ThemeMode.dark => ThemeMode.system,
-                    };
-                  },
-                );
-              },
-            ),
-            IconButton(
-              tooltip: '歌词去重',
-              icon: const Icon(Icons.lyrics_rounded),
-              onPressed: () => Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => const LrcDedupScreen()),
-              ),
-            ),
-            IconButton(
-              tooltip: '设置',
-              icon: const Icon(Icons.settings_rounded),
-              onPressed: () => Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => const SettingsScreen()),
-              ),
-            ),
-          ],
+            ],
+          ),
         ),
-        body: scanning
-            ? Center(
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 48),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        totalSongs > 0 ? '共 $totalSongs 首' : '正在扫描...',
-                        style: const TextStyle(
-                            fontSize: 16, fontWeight: FontWeight.bold),
-                      ),
-                      const SizedBox(height: 12),
-                      ClipRRect(
-                        borderRadius: BorderRadius.circular(4),
-                        child: LinearProgressIndicator(
-                          value: scanProgress > 0 ? scanProgress : null,
-                          minHeight: 8,
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      Text(
-                        scanPhase.isEmpty
-                            ? ''
-                            : '$scanPhase ${(scanProgress * 100).toStringAsFixed(0)}%',
-                        style: TextStyle(
-                            fontSize: 13,
-                            color: Theme.of(context)
-                                .colorScheme
-                                .onSurfaceVariant),
-                      ),
-                    ],
-                  ),
-                ),
-              )
-            : groups.isEmpty
-                ? _buildEmpty(scheme)
-                : _buildResults(scheme, list),
-        floatingActionButton: groups.isEmpty || scanning
-            ? null
-            : Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  FloatingActionButton.small(
-                    heroTag: 'refresh',
-                    tooltip: '重新扫描',
-                    onPressed: _scan,
-                    child: const Icon(Icons.refresh_rounded),
-                  ),
-                  const SizedBox(width: 12),
-                  if (totalSelected > 0)
-                    FloatingActionButton.extended(
-                      heroTag: 'delete',
-                      onPressed: _confirmDelete,
-                      icon: const Icon(Icons.delete_forever_rounded),
-                      label: Text('移至回收站 $totalSelected'),
-                      backgroundColor: Colors.red.shade700,
-                      foregroundColor: Colors.white,
-                    ),
-                ],
-              ),
+        bottomNavigationBar:
+            (groups.isEmpty || scanning) ? null : _buildBottomBar(scheme),
       ),
     );
   }
 
+  /// 扫描中：进度显示（原 build 内联 UI，原样搬运）
+  Widget _buildScanning() {
+    final scheme = Theme.of(context).colorScheme;
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 48),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              totalSongs > 0 ? '共 $totalSongs 首' : '正在扫描...',
+              style:
+                  const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 12),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: LinearProgressIndicator(
+                value: scanProgress > 0 ? scanProgress : null,
+                minHeight: 8,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              scanPhase.isEmpty
+                  ? ''
+                  : '$scanPhase ${(scanProgress * 100).toStringAsFixed(0)}%',
+              style: TextStyle(
+                  fontSize: 13, color: scheme.onSurfaceVariant),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 顶栏：左"清聆"大标题（字间距拉开），右回收站 + 设置两个扁平圆按钮
+  Widget _buildTopBar(ColorScheme scheme) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 8, 16, 0),
+      child: Row(
+        children: [
+          const Text(
+            '清聆',
+            style: TextStyle(
+              fontSize: 22,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 5,
+            ),
+          ),
+          const Spacer(),
+          MinimalIconButton(
+            icon: Icons.recycling_rounded,
+            tooltip: '回收站',
+            size: 38,
+            iconSize: 19,
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const TrashScreen()),
+            ),
+          ),
+          const SizedBox(width: 10),
+          MinimalIconButton(
+            icon: Icons.settings_rounded,
+            tooltip: '设置',
+            size: 38,
+            iconSize: 19,
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => SettingsScreen(
+                  onExportList: _exportDuplicateList,
+                  onShowDirStats: _showDirStats,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 数据总览：一行文字，数字加粗，点击弹出曲库统计（原汇总行逻辑保留）
+  Widget _buildStatsLine(ColorScheme scheme) {
+    return InkWell(
+      onTap: _showStatsSheet,
+      borderRadius: BorderRadius.circular(6),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 10, 20, 0),
+        child: RichText(
+          text: TextSpan(
+            style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+            children: [
+              const TextSpan(text: '共 '),
+              TextSpan(
+                text: '$totalSongs',
+                style: TextStyle(
+                    fontWeight: FontWeight.w700, color: scheme.onSurface),
+              ),
+              const TextSpan(text: ' 首 · '),
+              TextSpan(
+                text: '${groups.length}',
+                style: TextStyle(
+                    fontWeight: FontWeight.w700, color: scheme.onSurface),
+              ),
+              const TextSpan(text: ' 组重复 · 可释放 '),
+              TextSpan(
+                text: _fmt(totalSelectedBytes),
+                style: TextStyle(
+                    fontWeight: FontWeight.w700, color: scheme.onSurface),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 标签排：普通模式=筛选 chips；多选模式=智能选中/清空/退出多选（同一样式）
+  Widget _buildChipRow(ColorScheme scheme) {
+    if (multiSelectMode) {
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
+        child: Row(
+          children: [
+            MinimalChip(
+              label: '智能选中',
+              selected: true,
+              onTap: _smartSelect,
+            ),
+            const SizedBox(width: 8),
+            MinimalChip(
+              label: '清空',
+              selected: false,
+              enabled: totalSelected > 0,
+              onTap: _clearSelections,
+            ),
+            const SizedBox(width: 8),
+            MinimalChip(
+              label: '退出多选',
+              selected: false,
+              onTap: _exitMultiSelect,
+            ),
+          ],
+        ),
+      );
+    }
+    const filters = ['全部', '标题一致', '不同版本'];
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
+      child: Row(
+        children: [
+          for (int i = 0; i < filters.length; i++) ...[
+            if (i > 0) const SizedBox(width: 8),
+            MinimalChip(
+              label: filters[i],
+              selected: reasonFilter == filters[i],
+              onTap: () => setState(() => reasonFilter = filters[i]),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// 搜索 + 排序（原功能保留，极简样式）
+  Widget _buildSearchRow(ColorScheme scheme) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 10, 12, 0),
+      child: Row(
+        children: [
+          Expanded(
+            child: TextField(
+              decoration: InputDecoration(
+                hintText: '搜索歌曲/歌手…',
+                hintStyle: TextStyle(fontSize: 13, color: scheme.outline),
+                prefixIcon:
+                    Icon(Icons.search_rounded, size: 18, color: scheme.outline),
+                suffixIcon: searchQuery.isNotEmpty
+                    ? IconButton(
+                        icon: const Icon(Icons.clear_rounded, size: 16),
+                        onPressed: () => setState(() => searchQuery = ''),
+                      )
+                    : null,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 8,
+                ),
+                isDense: true,
+              ),
+              style: const TextStyle(fontSize: 13),
+              onChanged: (v) => setState(() => searchQuery = v),
+            ),
+          ),
+          const SizedBox(width: 4),
+          _SortMenuButton(
+            value: sortBy,
+            onChanged: (v) => setState(() => sortBy = v),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 底部栏：已选 N 首 + 刷新（浅灰圆）+ 删除（黑圆），刷新紧挨删除
+  Widget _buildBottomBar(ColorScheme scheme) {
+    return SafeArea(
+      top: false,
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(20, 10, 20, 14),
+        decoration: BoxDecoration(
+          color: scheme.surface,
+          border: Border(
+            top: BorderSide(color: scheme.outlineVariant),
+          ),
+        ),
+        child: Row(
+          children: [
+            Text(
+              '已选 ',
+              style:
+                  TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
+            ),
+            Text(
+              '$totalSelected',
+              style: const TextStyle(
+                  fontSize: 17, fontWeight: FontWeight.w700),
+            ),
+            Text(
+              ' 首',
+              style:
+                  TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
+            ),
+            const Spacer(),
+            MinimalIconButton(
+              icon: Icons.refresh_rounded,
+              tooltip: '重新扫描',
+              size: 46,
+              iconSize: 22,
+              onPressed: _scan,
+            ),
+            const SizedBox(width: 12),
+            if (totalSelected > 0)
+              MinimalIconButton(
+                icon: Icons.delete_outline_rounded,
+                tooltip: '移至回收站',
+                size: 46,
+                iconSize: 22,
+                dark: true,
+                onPressed: _confirmDelete,
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 空状态：黑白极简。灰色圆角音乐图标 + 标题 + 副标题 + 黑色 pill 扫描按钮。
   Widget _buildEmpty(ColorScheme scheme) {
     final bool isNoDup =
         totalSongs > 0 && groups.isEmpty && status.contains('未发现');
+    final dark = Theme.of(context).brightness == Brightness.dark;
     return Center(
       child: SingleChildScrollView(
         padding: const EdgeInsets.all(32),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(
-              isNoDup ? Icons.check_circle_outline_rounded : Icons.library_music_rounded,
-              size: 64,
-              color: isNoDup ? Colors.green : scheme.primary,
+            Container(
+              width: 72,
+              height: 72,
+              decoration: BoxDecoration(
+                color: secondaryFillColor(context),
+                borderRadius: BorderRadius.circular(22),
+                border: dark
+                    ? Border.all(color: scheme.outlineVariant, width: 1)
+                    : null,
+              ),
+              child: Icon(
+                isNoDup
+                    ? Icons.check_rounded
+                    : Icons.music_note_rounded,
+                size: 32,
+                color: scheme.onSurfaceVariant,
+              ),
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: 20),
             Text(
               isNoDup ? '没有重复项目' : '发现重复歌曲',
-              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+              style: const TextStyle(
+                  fontSize: 17, fontWeight: FontWeight.w700),
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 6),
             Text(
               isNoDup ? '已扫描 $totalSongs 首，未发现重复歌曲。' : status,
               textAlign: TextAlign.center,
-              style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13),
+              style:
+                  TextStyle(color: scheme.onSurfaceVariant, fontSize: 12),
             ),
-            const SizedBox(height: 24),
-            FilledButton.icon(
-              onPressed: _scan,
-              icon: Icon(isNoDup ? Icons.refresh_rounded : Icons.radar_rounded),
-              label: Text(isNoDup ? '重新扫描' : '扫描相似歌曲'),
+            const SizedBox(height: 28),
+            GestureDetector(
+              onTap: _scan,
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 28, vertical: 14),
+                decoration: BoxDecoration(
+                  color: primaryFillColor(context),
+                  borderRadius: BorderRadius.circular(999),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      isNoDup
+                          ? Icons.refresh_rounded
+                          : Icons.radar_rounded,
+                      size: 16,
+                      color: onPrimaryFillColor(context),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      isNoDup ? '重新扫描' : '扫描相似歌曲',
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w700,
+                        color: onPrimaryFillColor(context),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             ),
           ],
         ),
@@ -1083,17 +1326,19 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildResults(ColorScheme scheme, List<DuplicateGroup> list) {
-    // 搜索/汇总头钉在顶部，不随滚动消失
+    // 统计/chips/搜索钉在顶部，不随滚动消失（顶栏已在外层）
     return Column(
       children: [
-        Container(
-          color: scheme.surface,
-          padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-          child: _buildHeader(scheme),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: _buildStatsLine(scheme),
         ),
+        _buildChipRow(scheme),
+        _buildSearchRow(scheme),
+        const SizedBox(height: 8),
         Expanded(
           child: ListView.builder(
-            padding: const EdgeInsets.fromLTRB(12, 4, 12, 96),
+            padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
             itemCount: list.length,
             itemBuilder: (ctx, i) {
               final g = list[i];
@@ -1123,6 +1368,8 @@ class _HomeScreenState extends State<HomeScreen> {
                 freeBytes: _freeOf(g),
                 hasCover: hasCoverMap,
                 hasLyrics: hasLyricsMap,
+                multiSelectMode: multiSelectMode,
+                onEnterMultiSelect: _enterMultiSelect,
               );
             },
           ),
@@ -1130,117 +1377,102 @@ class _HomeScreenState extends State<HomeScreen> {
       ],
     );
   }
+}
 
-  Widget _buildHeader(ColorScheme scheme) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        // 一行汇总：点击弹出曲库统计
-        InkWell(
-          onTap: _showStatsSheet,
-          borderRadius: BorderRadius.circular(6),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(vertical: 2),
-            child: Text(
-              '共 $totalSongs 首 · ${groups.length} 组重复 · 已选 $totalSelected 首 · 可释放 ${_fmt(totalSelectedBytes)} ⓘ',
-              style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
-            ),
-          ),
-        ),
-        const SizedBox(height: 8),
-        Row(
-          children: [
-            Expanded(
-              child: TextField(
-                decoration: InputDecoration(
-                  hintText: '搜索歌曲/歌手…',
-                  hintStyle:
-                      TextStyle(fontSize: 13, color: scheme.outline),
-                  prefixIcon:
-                      Icon(Icons.search_rounded, size: 18, color: scheme.outline),
-                  suffixIcon: searchQuery.isNotEmpty
-                      ? IconButton(
-                          icon: const Icon(Icons.clear_rounded, size: 16),
-                          onPressed: () =>
-                              setState(() => searchQuery = ''),
-                        )
-                      : null,
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12),
+/// 极简排序菜单按钮：点击弹出白卡菜单（1px 细边框 + 14px 圆角），
+/// 选中项黑字加粗 + 右侧对勾，无灰底高亮。与设置页下拉框统一。
+class _SortMenuButton extends StatelessWidget {
+  final String value;
+  final ValueChanged<String> onChanged;
+
+  const _SortMenuButton({
+    required this.value,
+    required this.onChanged,
+  });
+
+  static const _options = {
+    'count': '按数量排序',
+    'size': '按大小排序',
+    'free': '按可释放空间排序',
+  };
+
+  Future<void> _showMenu(BuildContext context) async {
+    final scheme = Theme.of(context).colorScheme;
+    final button = context.findRenderObject() as RenderBox?;
+    final overlay =
+        Navigator.of(context).overlay?.context.findRenderObject() as RenderBox?;
+    if (button == null || overlay == null) return;
+    final position = RelativeRect.fromRect(
+      Rect.fromPoints(
+        button.localToGlobal(Offset.zero, ancestor: overlay),
+        button.localToGlobal(button.size.bottomRight(Offset.zero),
+            ancestor: overlay),
+      ),
+      Offset.zero & overlay.size,
+    );
+    final entries = _options.entries.toList();
+    final result = await showMenu<String>(
+      context: context,
+      position: position,
+      color: scheme.surface,
+      elevation: 8,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(14),
+        side: BorderSide(color: scheme.outlineVariant, width: 1),
+      ),
+      items: [
+        for (var i = 0; i < entries.length; i++) ...[
+          if (i > 0) const PopupMenuDivider(height: 1),
+          PopupMenuItem<String>(
+            value: entries[i].key,
+            padding:
+                const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  entries[i].value,
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: entries[i].key == value
+                        ? FontWeight.w700
+                        : FontWeight.normal,
+                    color: entries[i].key == value
+                        ? scheme.onSurface
+                        : scheme.onSurfaceVariant,
                   ),
-                  contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 8,
-                  ),
-                  isDense: true,
                 ),
-                style: const TextStyle(fontSize: 13),
-                onChanged: (v) => setState(() => searchQuery = v),
-              ),
-            ),
-            const SizedBox(width: 4),
-            PopupMenuButton<String>(
-              tooltip: '排序',
-              icon: const Icon(Icons.sort_rounded),
-              initialValue: sortBy,
-              onSelected: (v) => setState(() => sortBy = v),
-              itemBuilder: (_) => const [
-                PopupMenuItem(
-                  value: 'count',
-                  child: Text('按数量排序'),
-                ),
-                PopupMenuItem(
-                  value: 'size',
-                  child: Text('按大小排序'),
-                ),
-                PopupMenuItem(
-                  value: 'free',
-                  child: Text('按可释放空间排序'),
-                ),
+                if (entries[i].key == value) ...[
+                  const SizedBox(width: 8),
+                  Icon(Icons.check_rounded,
+                      size: 14, color: scheme.onSurface),
+                ],
               ],
             ),
-          ],
-        ),
-        Row(
-          children: [
-            TextButton.icon(
-              onPressed: () => setState(() {
-                final keepN = keepBestNotifier.value;
-                for (final g in groups) {
-                  selections[g.key] = g.noAutoSelect
-                      ? <String>{}
-                      : QualityService.autoSelectByRule(g.songs, keepBest: keepN,
-                          rule: keepRuleNotifier.value,
-                          preferredDir: keepDirNotifier.value);
-                }
-              }),
-              icon: const Icon(Icons.auto_awesome_rounded, size: 16),
-              label: const Text('智能选中', style: TextStyle(fontSize: 12)),
-            ),
-            TextButton.icon(
-              onPressed: totalSelected == 0
-                  ? null
-                  : () => setState(
-                        () => selections.updateAll((k, v) => <String>{}),
-                      ),
-              icon: const Icon(Icons.deselect_rounded, size: 16),
-              label: const Text('清空', style: TextStyle(fontSize: 12)),
-            ),
-            TextButton.icon(
-              onPressed: () => _exportDuplicateList(),
-              icon: const Icon(Icons.share_rounded, size: 16),
-              label: const Text('导出清单', style: TextStyle(fontSize: 12)),
-            ),
-            TextButton.icon(
-              onPressed: () => _showDirStats(),
-              icon: const Icon(Icons.folder_rounded, size: 16),
-              label: const Text('目录统计', style: TextStyle(fontSize: 12)),
-            ),
-          ],
-        ),
-        const Divider(height: 8),
-        const SizedBox(height: 4),
+          ),
+        ],
       ],
+    );
+    if (result != null) onChanged(result);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: '排序',
+      child: InkWell(
+        onTap: () => _showMenu(context),
+        customBorder: const CircleBorder(),
+        child: Padding(
+          padding: const EdgeInsets.all(8),
+          child: Icon(
+            Icons.sort_rounded,
+            size: 20,
+            color: scheme.onSurfaceVariant,
+          ),
+        ),
+      ),
     );
   }
 }

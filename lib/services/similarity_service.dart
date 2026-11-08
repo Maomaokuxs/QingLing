@@ -48,6 +48,15 @@ class SimilarityService {
   ///    不再因曲库大而静默跳过。
   /// 4. 文件内容哈希全等：字节级相同的副本（文件名不同也认得）。
   ///    注意这是字节哈希不是声学指纹，转码过的认不出——那是第 2 层的事。
+  ///
+  /// 组内元数据版本检测（不走开关，每次扫描都做，纯字符串比对）：
+  /// 同名组内用文字脚本/版本关键词/歌手区分不同语言/版本。
+  /// 不同版本拆成新组（reason='同名不同版本'，noAutoSelect=true，
+  /// 不自动勾选、不进删除项）。chroma 抓旋律，分辨不了同旋律换语言。
+  ///
+  /// 组内版本细分（enableCrossLingual=true 时）：对 Tier 1 同名组做 chroma
+  /// 二次验证，同一录音保留原组，不同版本/语言拆成新组（reason='同名不同版本'，
+  /// noAutoSelect=true，不自动勾选、不进删除项）。
   static Future<List<DuplicateGroup>> groupSimilarSongsWithFingerprint(
     List<SongFile> all, {
     double titleThreshold = 0.9,
@@ -56,7 +65,6 @@ class SimilarityService {
     bool enableCrossLingual = false,
     void Function(int done, int total)? onProgress,
     void Function(int done, int total)? onChromaProgress,
-    void Function(int done, int total)? onCrossLingualProgress,
   }) async {
     if (all.isEmpty) return [];
     // Tier 1~3：同步 CPU 密集计算（O(n²) 字符串比对），在后台 isolate
@@ -77,9 +85,17 @@ class SimilarityService {
         .map((e) => SongFile.fromJson(Map<String, dynamic>.from(e as Map)))
         .toList();
 
-    // 同名组声学细分：同一标题/歌手下，用 chroma 指纹区分同一录音与不同版本。
-    // 只对 Tier 1（标题/歌手一致）组做，不同版本拆出且不自动勾选。
-    result = await _subdivideTitleGroupsByChroma(result, onProgress: onChromaProgress);
+    // 组内元数据版本检测（不走开关，每次扫描都做）：脚本/版本关键词/歌手
+    // 区分不同语言/版本。不同版本拆出且不自动勾选，不进删除项。
+    result = subdivideByMetadata(result);
+
+    // 组内版本细分（设置页"组内版本细分"开关）：同一标题/歌手下，用 chroma 指纹
+    // 区分同一录音与不同版本/语言。不同版本拆出且不自动勾选，不进删除项。
+    // 关闭则跳过，扫描更快。
+    if (enableCrossLingual) {
+      result = await _subdivideTitleGroupsByChroma(result,
+          onProgress: onChromaProgress);
+    }
 
     // Tier 4: 文件内容哈希（可开关，IO 开销大）
     if (enableFingerprint && remaining.length >= 2) {
@@ -87,20 +103,6 @@ class SimilarityService {
         remaining,
         durationToleranceMs,
         onProgress,
-      );
-      final grouped = gs.expand((g) => g.songs.map((s) => s.path)).toSet();
-      result.addAll(gs);
-      remaining = remaining.where((s) => !grouped.contains(s.path)).toList();
-    }
-
-    // 跨语言版本检测：在未分组歌曲中找时长接近 + chroma 高度相似的对
-    // （伴奏一致、语言不同，如中/英文版）。只对 remaining 做，不打乱已有分组。
-    // 结果 reason='跨语言版本'，noAutoSelect=true，默认不勾选。
-    // 默认关闭（设置页可开）：chroma 计算重，首扫慢。
-    if (enableCrossLingual && remaining.length >= 2) {
-      final gs = await _findCrossLingualGroups(
-        remaining,
-        onProgress: onCrossLingualProgress,
       );
       final grouped = gs.expand((g) => g.songs.map((s) => s.path)).toSet();
       result.addAll(gs);
@@ -544,6 +546,274 @@ class SimilarityService {
   /// 宁可把边界情况判为"不同版本"（不自动删，用户手动看）。
   static const double _chromaSameAudioThreshold = 0.99;
 
+  // ---------- 组内元数据版本检测 ----------
+
+  /// 文字脚本。kana/hangul 只在日/韩文出现，最具区分性；拉丁字母
+  /// 在各语言元数据里都常见（艺人名/罗马音），优先级最低。
+  static const _scriptPriority = ['kana', 'hangul', 'han', 'latin'];
+
+  /// 版本关键词（按优先级排序，先匹配先赢）：
+  /// 伴奏/听障类最具体；语言版次之；通用"版本"最后。
+  /// ASCII 关键词用词边界正则，避免 "Instinct" 误含 "inst"。
+  static final _versionKeywordPatterns = <(Pattern, String)>[
+    ('伴奏', '伴奏'),
+    (RegExp(r'\binstrumental\b'), '伴奏'),
+    (RegExp(r'\boff vocal\b'), '伴奏'),
+    (RegExp(r'\bkaraoke\b'), '伴奏'),
+    (RegExp(r'\binst\b'), '伴奏'),
+    ('听障', '听障'),
+    ('低频', '听障'),
+    (RegExp(r'\bhearing\b'), '听障'),
+    ('中文版', '中文版'),
+    ('英文版', '英文版'),
+    ('韩文版', '韩文版'),
+    ('日文版', '日文版'),
+    ('粤语版', '粤语版'),
+    (RegExp(r'\bver\.'), '版本'),
+    (RegExp(r'\bversion\b'), '版本'),
+    ('版本', '版本'),
+  ];
+
+  /// 歌曲的主要文字脚本：统计标题+歌手的各脚本字符数，取最多者。
+  /// 并列时按 _scriptPriority 取最具区分性的。无脚本字符时返回 'unknown'。
+  /// 先去掉括号内容（"夜曲 (Remastered)" 是中文歌，括号英文不算），
+  /// displayName 兜底时先去扩展名（".flac" 里的拉丁字母不算）。
+  /// 公开以便测试。
+  static String dominantScriptOf(SongFile s) {
+    var text = '${s.title} ${s.artist}';
+    if (text.trim().isEmpty) {
+      text = s.displayName.replaceAll(RegExp(r'\.[a-zA-Z0-9]+$'), '');
+    }
+    // 去括号内容：(Live) / [Remastered] 等标注不是歌曲语言
+    text = text.replaceAll(RegExp(r'\(.*?\)'), '');
+    text = text.replaceAll(RegExp(r'\[.*?\]'), '');
+    final counts = <String, int>{};
+    for (final c in text.runes) {
+      String? script;
+      if ((c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A)) {
+        script = 'latin';
+      } else if ((c >= 0xAC00 && c <= 0xD7AF) ||
+          (c >= 0x1100 && c <= 0x11FF) ||
+          (c >= 0x3130 && c <= 0x318F)) {
+        script = 'hangul';
+      } else if ((c >= 0x3040 && c <= 0x309F) ||
+          (c >= 0x30A0 && c <= 0x30FF)) {
+        script = 'kana';
+      } else if (c >= 0x4E00 && c <= 0x9FFF) {
+        script = 'han';
+      }
+      if (script != null) counts[script] = (counts[script] ?? 0) + 1;
+    }
+    if (counts.isEmpty) return 'unknown';
+    var best = '';
+    var bestCount = -1;
+    for (final script in _scriptPriority) {
+      final n = counts[script] ?? 0;
+      if (n > bestCount) {
+        bestCount = n;
+        best = script;
+      }
+    }
+    return best;
+  }
+
+  /// 版本标签：标题/文件名含版本关键词则返回对应标签，否则 '原版'。
+  /// 公开以便测试。
+  static String versionTagOf(SongFile s) {
+    final text = '${s.title} ${s.displayName}'.toLowerCase();
+    for (final (pattern, tag) in _versionKeywordPatterns) {
+      if (pattern.allMatches(text).isNotEmpty) return tag;
+    }
+    return '原版';
+  }
+
+  /// 歌手是否兼容：归一化后相等，或一方包含另一方（"周杰伦" vs
+  /// "周杰伦&方文山" 是合作关系，不拆），或编辑距离在笔误容忍内
+  /// （"周杰伦" vs "周杰轮" 是元数据笔误，不拆）。
+  /// 任一方为空/未知/过短时无法判断，视为兼容，不拆。公开以便测试。
+  static bool artistsCompatible(String a, String b) {
+    final na = _normText(a);
+    final nb = _normText(b);
+    if (na.isEmpty || nb.isEmpty) return true;
+    if (na == 'unknown' ||
+        na == 'unknownartist' ||
+        nb == 'unknown' ||
+        nb == 'unknownartist') {
+      return true;
+    }
+    if (na == nb) return true;
+    if (na.length < 2 || nb.length < 2) return true;
+    if (na.contains(nb) || nb.contains(na)) return true;
+    // 笔误容忍：编辑距离 ≤ max(1, 短名长度/3)
+    final minLen = na.length < nb.length ? na.length : nb.length;
+    final tol = minLen ~/ 3 > 1 ? minLen ~/ 3 : 1;
+    return _editDistance(na, nb) <= tol;
+  }
+
+  /// Levenshtein 编辑距离（小串，O(m*n) 可接受）。
+  static int _editDistance(String a, String b) {
+    final m = a.length;
+    final n = b.length;
+    if (m == 0) return n;
+    if (n == 0) return m;
+    var prev = List<int>.generate(n + 1, (j) => j);
+    var cur = List<int>.filled(n + 1, 0);
+    for (var i = 1; i <= m; i++) {
+      cur[0] = i;
+      for (var j = 1; j <= n; j++) {
+        final cost = a.codeUnitAt(i - 1) == b.codeUnitAt(j - 1) ? 0 : 1;
+        var best = prev[j] + 1;
+        if (cur[j - 1] + 1 < best) best = cur[j - 1] + 1;
+        if (prev[j - 1] + cost < best) best = prev[j - 1] + cost;
+        cur[j] = best;
+      }
+      final tmp = prev;
+      prev = cur;
+      cur = tmp;
+    }
+    return prev[n];
+  }
+
+  /// feat. 歌手集合：从标题/歌手/文件名提取 feat./featuring/ft. 后的歌手名。
+  /// 格式多样：`feat. A`、`featuring A`、`ft. A`、`(feat. A)`、`feat A`、
+  /// 多人用 &/、/，/与/and 分隔（`feat. A & B`）。
+  /// 逐字段查找（标题 → 歌手 → 文件名），首个含 feat. 的字段为准；
+  /// 返回归一化后的名字集合；无 feat. 信息时返回空集合。
+  /// 公开以便测试。
+  static Set<String> featArtistsOf(SongFile s) {
+    final fields = [
+      s.title,
+      s.artist,
+      s.displayName.replaceAll(RegExp(r'\.[a-zA-Z0-9]+$'), ''),
+    ];
+    for (final field in fields) {
+      final found = _featArtistsInText(field);
+      if (found.isNotEmpty) return found;
+    }
+    return {};
+  }
+
+  /// 从单段文本提取 feat. 后的歌手名集合。
+  static Set<String> _featArtistsInText(String text) {
+    final m = RegExp(
+      r'\b(?:featuring|feat\.?|ft\.?)\b\s*[:：]?\s*',
+      caseSensitive: false,
+    ).firstMatch(text);
+    if (m == null) return {};
+    var rest = text.substring(m.end);
+    // 截断：右括号/分隔符/新括号标注都表示 feat. 部分结束
+    final cut = RegExp(r'[\)\]\}\|\n]|\(|\[| - | – | — ').firstMatch(rest);
+    if (cut != null) rest = rest.substring(0, cut.start);
+    final out = <String>{};
+    for (final part in rest.split(
+      RegExp(r'[&、，,;；+／/・]|\band\b|与'),
+    )) {
+      final name = _normText(part);
+      if (name.isNotEmpty) out.add(name);
+    }
+    return out;
+  }
+
+  /// feat. 是否兼容：都无 feat. → 兼容；一方有、一方无 → 不兼容；
+  /// 都有 → 集合相等才兼容。公开以便测试。
+  static bool featCompatible(SongFile a, SongFile b) {
+    final fa = featArtistsOf(a);
+    final fb = featArtistsOf(b);
+    if (fa.isEmpty && fb.isEmpty) return true;
+    if (fa.isEmpty || fb.isEmpty) return false;
+    return fa.length == fb.length && fa.containsAll(fb);
+  }
+
+  /// 元数据兼容：脚本、版本标签、歌手、feat. 四项都兼容才算兼容，任一不同即拆组。
+  /// 脚本 unknown（无脚本字符）视为通配，不拆。
+  static bool _metadataCompatible(SongFile a, SongFile b) {
+    final sa = dominantScriptOf(a);
+    final sb = dominantScriptOf(b);
+    if (sa != 'unknown' && sb != 'unknown' && sa != sb) return false;
+    if (versionTagOf(a) != versionTagOf(b)) return false;
+    if (!artistsCompatible(a.artist, b.artist)) return false;
+    if (!featCompatible(a, b)) return false;
+    return true;
+  }
+
+  /// 组内按元数据聚类：单链（兼容即同簇）。公开以便测试。
+  static List<List<SongFile>> clusterByMetadata(List<SongFile> songs) {
+    final parent = <String, String>{for (final s in songs) s.path: s.path};
+    String find(String x) {
+      var r = x;
+      while (parent[r] != r) {
+        r = parent[r]!;
+      }
+      var c = x;
+      while (parent[c] != r) {
+        final n = parent[c]!;
+        parent[c] = r;
+        c = n;
+      }
+      return r;
+    }
+
+    for (var i = 0; i < songs.length; i++) {
+      for (var j = i + 1; j < songs.length; j++) {
+        if (_metadataCompatible(songs[i], songs[j])) {
+          final ra = find(songs[i].path);
+          final rb = find(songs[j].path);
+          if (ra != rb) parent[ra] = rb;
+        }
+      }
+    }
+    final byRoot = <String, List<SongFile>>{};
+    for (final s in songs) {
+      byRoot.putIfAbsent(find(s.path), () => []).add(s);
+    }
+    return byRoot.values.toList();
+  }
+
+  /// 对所有组做元数据细分：最大簇保留原组，其余拆成
+  /// reason='同名不同版本'、noAutoSelect=true 的新组。
+  /// 只保留长度 >= 2 的簇：单首簇丢弃，全是单首簇时整组丢弃。
+  /// 公开以便测试。纯字符串比对，不走开关，每次扫描都做。
+  static List<DuplicateGroup> subdivideByMetadata(List<DuplicateGroup> groups) {
+    final out = <DuplicateGroup>[];
+    for (final g in groups) {
+      if (g.songs.length < 2) {
+        // 单首歌不是重复组，直接丢弃
+        continue;
+      }
+      final clusters = clusterByMetadata(g.songs);
+      if (clusters.length <= 1) {
+        out.add(g);
+        continue;
+      }
+      clusters.sort((a, b) => b.length.compareTo(a.length));
+      // 只保留 >= 2 的簇，单首簇丢弃
+      final valid = clusters.where((c) => c.length >= 2).toList();
+      if (valid.isEmpty) {
+        debugPrint('[song_dedup] metadata subdivided "${g.displayTitle}": '
+            'all singletons, group dropped');
+        continue;
+      }
+      out.add(DuplicateGroup(
+        key: g.key,
+        songs: QualityService.sortByQualityDesc(valid.first),
+        displayTitle: g.displayTitle,
+        reason: g.reason,
+      ));
+      for (var i = 1; i < valid.length; i++) {
+        out.add(DuplicateGroup(
+          key: '${g.key}::meta$i',
+          songs: QualityService.sortByQualityDesc(valid[i]),
+          displayTitle: g.displayTitle,
+          reason: '同名不同版本',
+          noAutoSelect: true,
+        ));
+      }
+      debugPrint('[song_dedup] metadata subdivided "${g.displayTitle}": '
+          '${clusters.map((c) => c.length).toList()}');
+    }
+    return out;
+  }
+
   /// 对 Tier 1（标题/歌手一致）组做 chroma 细分。
   /// 同一录音的保留原组；不同版本拆成新组（reason='同名不同版本'，
   /// noAutoSelect=true）。指纹按 path+mtime 缓存，3 路并行计算。
@@ -604,16 +874,23 @@ class SimilarityService {
         continue;
       }
       clusters.sort((a, b) => b.length.compareTo(a.length));
+      // 只保留 >= 2 的簇，单首簇丢弃；全是单首簇时整组丢弃
+      final valid = clusters.where((c) => c.length >= 2).toList();
+      if (valid.isEmpty) {
+        debugPrint('[song_dedup] chroma subdivided "${g.displayTitle}": '
+            'all singletons, group dropped');
+        continue;
+      }
       out.add(DuplicateGroup(
         key: g.key,
-        songs: QualityService.sortByQualityDesc(clusters.first),
+        songs: QualityService.sortByQualityDesc(valid.first),
         displayTitle: g.displayTitle,
         reason: g.reason,
       ));
-      for (var i = 1; i < clusters.length; i++) {
+      for (var i = 1; i < valid.length; i++) {
         out.add(DuplicateGroup(
           key: '${g.key}::ver$i',
-          songs: QualityService.sortByQualityDesc(clusters[i]),
+          songs: QualityService.sortByQualityDesc(valid[i]),
           displayTitle: g.displayTitle,
           reason: '同名不同版本',
           noAutoSelect: true,
@@ -693,129 +970,5 @@ class SimilarityService {
       }
     }
     await Future.wait(List.generate(concurrency, (_) => worker()));
-  }
-
-  /// 跨语言版本检测阈值：3 段 chroma 余弦均值。
-  /// 实测：星间旅行中/英文版（同伴奏）= 0.9937；不同歌曲 <= 0.972。
-  /// 取 0.985，只抓伴奏高度一致的；分组默认不自动勾选，误判用户手动忽略。
-  static const double chromaCrossLingualThreshold = 0.985;
-
-  /// 跨语言版本检测：在未分组歌曲中，找时长接近（<= min(2%, 5000ms)）
-  /// 且 chroma 相似度 >= 0.985 的对，单链聚类成组。
-  /// 只比较时长候选对，不做全量 O(n^2) 声学比对。
-  static Future<List<DuplicateGroup>> _findCrossLingualGroups(
-    List<SongFile> remaining, {
-    void Function(int done, int total)? onProgress,
-  }) async {
-    if (remaining.length < 2) return [];
-
-    // 1. 按时长排序，滑动窗口找候选对
-    final sorted = List<SongFile>.from(remaining)
-      ..sort((a, b) => a.durationMs.compareTo(b.durationMs));
-    final candidatePairs = <List<SongFile>>[];
-    final inCandidate = <String>{};
-    for (var i = 0; i < sorted.length; i++) {
-      for (var j = i + 1; j < sorted.length; j++) {
-        final dd = sorted[j].durationMs - sorted[i].durationMs;
-        final tol =
-            min(3000, (sorted[i].durationMs * 0.01).round()).toInt();
-        if (dd > tol) break;
-        candidatePairs.add([sorted[i], sorted[j]]);
-        inCandidate.add(sorted[i].path);
-        inCandidate.add(sorted[j].path);
-      }
-    }
-    if (candidatePairs.isEmpty) return [];
-
-    // 2. 计算候选歌曲的 chroma 指纹（缓存 + 3 路并行）
-    final cache = await ChromaFpCache.load();
-    final fps = <String, List<double>>{};
-    final toCompute = <SongFile>[];
-    for (final s in sorted) {
-      if (!inCandidate.contains(s.path)) continue;
-      final hit = cache.lookup(s.path, s.dateModified);
-      if (hit != null) {
-        fps[s.path] = hit;
-      } else {
-        toCompute.add(s);
-      }
-    }
-    var done = inCandidate.length - toCompute.length;
-    onProgress?.call(done, inCandidate.length);
-    var dirty = false;
-    await _parallel(toCompute, 3, (s) async {
-      List<double>? fp;
-      try {
-        fp = await ChromaFingerprintService.getChroma(s.id, s.path).timeout(
-            const Duration(seconds: 60), onTimeout: () => null);
-      } catch (_) {
-        fp = null;
-      }
-      if (fp != null) {
-        cache.store(s.path, s.dateModified, fp);
-        dirty = true;
-        fps[s.path] = fp;
-      }
-      done++;
-      onProgress?.call(done, inCandidate.length);
-    });
-    if (dirty) await cache.save();
-
-    // 3. 候选对连边（相似度 >= 阈值），并查集聚类
-    final parent = <String, String>{for (final p in inCandidate) p: p};
-    String find(String x) {
-      var r = x;
-      while (parent[r] != r) {
-        r = parent[r]!;
-      }
-      var c = x;
-      while (parent[c] != r) {
-        final n = parent[c]!;
-        parent[c] = r;
-        c = n;
-      }
-      return r;
-    }
-
-    for (final pair in candidatePairs) {
-      final a = fps[pair[0].path];
-      final b = fps[pair[1].path];
-      if (a == null || b == null) continue;
-      if (ChromaFingerprintService.similarity(a, b) >=
-          chromaCrossLingualThreshold) {
-        final ra = find(pair[0].path);
-        final rb = find(pair[1].path);
-        if (ra != rb) parent[ra] = rb;
-      }
-    }
-
-    final byRoot = <String, List<SongFile>>{};
-    final byPath = {for (final x in sorted) x.path: x};
-    for (final p in inCandidate) {
-      final song = byPath[p];
-      if (song == null) continue;
-      // 指纹缺失的跳过（无法判断，不硬分组）
-      if (!fps.containsKey(p)) continue;
-      byRoot.putIfAbsent(find(p), () => []).add(song);
-    }
-
-    // 4. 成组
-    final out = <DuplicateGroup>[];
-    var idx = 0;
-    for (final cluster in byRoot.values) {
-      if (cluster.length < 2) continue;
-      final ordered = QualityService.sortByQualityDesc(cluster);
-      out.add(DuplicateGroup(
-        key: 'crosslingual::$idx:${ordered.map((e) => e.path).join('|')}',
-        songs: ordered,
-        displayTitle: ordered.first.displayName,
-        reason: '跨语言版本',
-        noAutoSelect: true,
-      ));
-      idx++;
-      debugPrint('[song_dedup] cross-lingual group: '
-          '${ordered.map((e) => e.displayName).join(' / ')}');
-    }
-    return out;
   }
 }
