@@ -5,10 +5,21 @@
 import '../models/song_file.dart';
 
 class QualityService {
+  /// 音质比较（从高到低）：分数 -> 真实码率 -> 文件大小。
+  /// 分数打平（比如两个高码率 FLAC 都是 800 分）时，用码率/大小
+  /// 决定先后，避免任意排序导致码率高的反而被勾选删除。
+  static int compareQualityDesc(SongFile a, SongFile b) {
+    final qc = b.qualityScore.compareTo(a.qualityScore);
+    if (qc != 0) return qc;
+    final bc = b.bitrateKbps.compareTo(a.bitrateKbps);
+    if (bc != 0) return bc;
+    return b.sizeBytes.compareTo(a.sizeBytes);
+  }
+
   /// 按音质从高到低排序
   static List<SongFile> sortByQualityDesc(List<SongFile> list) {
     final copy = List<SongFile>.from(list);
-    copy.sort((a, b) => b.qualityScore.compareTo(a.qualityScore));
+    copy.sort(compareQualityDesc);
     return copy;
   }
 
@@ -37,7 +48,7 @@ class QualityService {
         final db = b.path.startsWith(preferredDir) ? 1 : 0;
         if (da != db) return db.compareTo(da);
       }
-      return b.qualityScore.compareTo(a.qualityScore);
+      return compareQualityDesc(a, b);
     });
     return copy;
   }

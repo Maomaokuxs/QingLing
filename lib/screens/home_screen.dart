@@ -8,7 +8,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../main.dart';
 import '../models/duplicate_group.dart';
 import '../models/song_file.dart';
-import '../services/audio_details_service.dart';
 import '../services/media_tags_service.dart';
 import 'lrc_dedup_screen.dart';
 import '../services/audio_scanner.dart';
@@ -16,7 +15,6 @@ import '../services/delete_service.dart';
 import '../services/ignore_service.dart';
 import '../services/quality_service.dart';
 import '../services/share_service.dart';
-import '../services/spectrum_cache.dart';
 import '../services/similarity_service.dart';
 import '../services/trash_service.dart';
 import '../widgets/group_card.dart';
@@ -50,12 +48,8 @@ class _HomeScreenState extends State<HomeScreen> {
   static const _debugChannel = MethodChannel('song_dedup/debug');
   String? _playingPath;
   Timer? _previewTimer;
-  // 假无损批量检测：path -> 是否疑似
-  final Map<String, bool> spectrumSuspect = {};
   final Map<String, bool> hasCoverMap = {};
   final Map<String, bool> hasLyricsMap = {};
-  bool spectrumScanning = false;
-  String spectrumStatus = '';
 
   @override
   void initState() {
@@ -337,18 +331,15 @@ class _HomeScreenState extends State<HomeScreen> {
       final g = (await SimilarityService.groupSimilarSongsWithFingerprint(
         all,
         enableFingerprint: fingerprintEnabledNotifier.value,
-        enableAcoustic: acousticFpEnabledNotifier.value,
+        enableCrossLingual: crossLingualEnabledNotifier.value,
         onProgress: (done, total) {
-          // 文件指纹阶段：若同时开音频指纹占 0~60%，否则占 0~100%
-          final end = acousticFpEnabledNotifier.value ? 0.6 : 1.0;
-          _updateScanProgress(done / (total == 0 ? 1 : total) * end, '文件指纹分析');
+          _updateScanProgress(done / (total == 0 ? 1 : total), '文件指纹分析');
         },
-        onAcousticProgress: (done, total) {
-          // 音频指纹阶段：若文件指纹也开了则从 60% 开始
-          final start = fingerprintEnabledNotifier.value ? 0.6 : 0.0;
-          _updateScanProgress(
-              start + done / (total == 0 ? 1 : total) * (1.0 - start),
-              '音频指纹分析');
+        onChromaProgress: (done, total) {
+          _updateScanProgress(done / (total == 0 ? 1 : total), '声学细分');
+        },
+        onCrossLingualProgress: (done, total) {
+          _updateScanProgress(done / (total == 0 ? 1 : total), '跨语言匹配');
         },
       ))
           // 跳过用户标记"不是重复"的分组
@@ -356,9 +347,12 @@ class _HomeScreenState extends State<HomeScreen> {
           .toList();
       final keepN = keepBestNotifier.value;
       for (final grp in g) {
-        selections[grp.key] =
-            QualityService.autoSelectByRule(grp.songs, keepBest: keepN,
-              rule: keepRuleNotifier.value, preferredDir: keepDirNotifier.value);
+        // 同名不同版本组不自动勾选，用户手动决定
+        selections[grp.key] = grp.noAutoSelect
+            ? <String>{}
+            : QualityService.autoSelectByRule(grp.songs, keepBest: keepN,
+                rule: keepRuleNotifier.value,
+                preferredDir: keepDirNotifier.value);
       }
       setState(() {
         groups = g;
@@ -366,8 +360,6 @@ class _HomeScreenState extends State<HomeScreen> {
             ? '未发现重复（共 $totalSongs 首）'
             : '发现 ${g.length} 组重复';
       });
-      // 扫描后后台批量检测假无损
-      _batchSpectrumCheck();
       // 扫描后后台批量检测封面/歌词
       _batchMediaTagsCheck();
       debugPrint('[song_dedup] scan done: ${g.length} groups, total=$totalSongs');
@@ -386,56 +378,6 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     } finally {
       if (mounted) setState(() => scanning = false);
-    }
-  }
-
-  /// 扫描后批量检测假无损：后台逐个解码无损文件，结果页打徽章。
-  /// native 侧已在后台线程，结果进 SpectrumCache 持久化。
-  Future<void> _batchSpectrumCheck() async {
-    debugPrint('[song_dedup] batchSpectrum start enabled=${batchSpectrumNotifier.value} groups=${groups.length}');
-    if (!batchSpectrumNotifier.value || groups.isEmpty) return;
-    const losslessExts = {'flac', 'wav', 'aiff', 'aif', 'alac', 'ape'};
-    final targets = <SongFile>[];
-    for (final g in groups) {
-      for (final s in g.songs) {
-        if (losslessExts.contains(s.extension.toLowerCase())) targets.add(s);
-      }
-    }
-    if (targets.isEmpty) return;
-    debugPrint('[song_dedup] batchSpectrum targets=${targets.length}');
-    final cache = await SpectrumCache.load();
-    var done = 0;
-    if (!mounted) return;
-    setState(() {
-      spectrumScanning = true;
-      spectrumStatus = '假无损检测中 0/${targets.length}';
-    });
-    try {
-      for (final s in targets) {
-        if (!mounted) return;
-        var r = cache.lookup(s.path, s.dateModified);
-        debugPrint('[song_dedup] batchSpectrum analyzing ${s.displayName}');
-        r ??= await AudioDetailsService.analyzeSpectrum(s.id, s.path);
-        debugPrint('[song_dedup] batchSpectrum done ${s.displayName} r=${r != null}');
-        if (r != null) {
-          cache.store(s.path, s.dateModified, r);
-          if (AudioDetailsService.isFakeLosslessSuspect(r)) {
-            setState(() => spectrumSuspect[s.path] = true);
-          }
-        }
-        done++;
-        setState(() => spectrumStatus = '假无损检测中 $done/${targets.length}');
-        // 让出 UI 线程
-        await Future.delayed(const Duration(milliseconds: 30));
-      }
-      await cache.save();
-    } finally {
-      if (mounted) {
-        setState(() {
-          spectrumScanning = false;
-          spectrumStatus = '';
-        });
-      }
     }
   }
 
@@ -1179,7 +1121,6 @@ class _HomeScreenState extends State<HomeScreen> {
                 onPreview: _togglePreview,
                 onCompare: () => _showCompareSheet(g),
                 freeBytes: _freeOf(g),
-                fakeLossless: spectrumSuspect,
                 hasCover: hasCoverMap,
                 hasLyrics: hasLyricsMap,
               );
@@ -1266,9 +1207,11 @@ class _HomeScreenState extends State<HomeScreen> {
               onPressed: () => setState(() {
                 final keepN = keepBestNotifier.value;
                 for (final g in groups) {
-                  selections[g.key] =
-                      QualityService.autoSelectByRule(g.songs, keepBest: keepN,
-                      rule: keepRuleNotifier.value, preferredDir: keepDirNotifier.value);
+                  selections[g.key] = g.noAutoSelect
+                      ? <String>{}
+                      : QualityService.autoSelectByRule(g.songs, keepBest: keepN,
+                          rule: keepRuleNotifier.value,
+                          preferredDir: keepDirNotifier.value);
                 }
               }),
               icon: const Icon(Icons.auto_awesome_rounded, size: 16),

@@ -5,8 +5,8 @@ import 'package:flutter/foundation.dart';
 
 import '../models/duplicate_group.dart';
 import '../models/song_file.dart';
-import 'acoustic_fp_cache.dart';
-import 'acoustic_fingerprint_service.dart';
+import 'chroma_fp_cache.dart';
+import 'chroma_fingerprint_service.dart';
 import 'fingerprint_cache.dart';
 import 'isolate_pool.dart';
 import 'quality_service.dart';
@@ -48,17 +48,15 @@ class SimilarityService {
   ///    不再因曲库大而静默跳过。
   /// 4. 文件内容哈希全等：字节级相同的副本（文件名不同也认得）。
   ///    注意这是字节哈希不是声学指纹，转码过的认不出——那是第 2 层的事。
-  /// 5. 音频指纹：基于声音内容的感知哈希。标题完全不同、元数据缺失的
-  ///    同音频副本也能认出来（比如文件名乱写、跨语言标题）。开销大，
-  ///    按 path+mtime 缓存，可在设置里关闭。
   static Future<List<DuplicateGroup>> groupSimilarSongsWithFingerprint(
     List<SongFile> all, {
     double titleThreshold = 0.9,
     int durationToleranceMs = 5000,
     bool enableFingerprint = true,
-    bool enableAcoustic = true,
+    bool enableCrossLingual = false,
     void Function(int done, int total)? onProgress,
-    void Function(int done, int total)? onAcousticProgress,
+    void Function(int done, int total)? onChromaProgress,
+    void Function(int done, int total)? onCrossLingualProgress,
   }) async {
     if (all.isEmpty) return [];
     // Tier 1~3：同步 CPU 密集计算（O(n²) 字符串比对），在后台 isolate
@@ -72,12 +70,16 @@ class SimilarityService {
         'titleThreshold': titleThreshold,
       }),
     );
-    final result = (syncOut['groups'] as List)
+    var result = (syncOut['groups'] as List)
         .map((e) => DuplicateGroup.fromJson(Map<String, dynamic>.from(e as Map)))
         .toList();
     var remaining = (syncOut['remaining'] as List)
         .map((e) => SongFile.fromJson(Map<String, dynamic>.from(e as Map)))
         .toList();
+
+    // 同名组声学细分：同一标题/歌手下，用 chroma 指纹区分同一录音与不同版本。
+    // 只对 Tier 1（标题/歌手一致）组做，不同版本拆出且不自动勾选。
+    result = await _subdivideTitleGroupsByChroma(result, onProgress: onChromaProgress);
 
     // Tier 4: 文件内容哈希（可开关，IO 开销大）
     if (enableFingerprint && remaining.length >= 2) {
@@ -91,10 +93,18 @@ class SimilarityService {
       remaining = remaining.where((s) => !grouped.contains(s.path)).toList();
     }
 
-    // Tier 5: 音频指纹（可开关，解码开销大）
-    if (enableAcoustic && remaining.length >= 2) {
-      final gs = await _acousticGroups(remaining, onProgress: onAcousticProgress);
+    // 跨语言版本检测：在未分组歌曲中找时长接近 + chroma 高度相似的对
+    // （伴奏一致、语言不同，如中/英文版）。只对 remaining 做，不打乱已有分组。
+    // 结果 reason='跨语言版本'，noAutoSelect=true，默认不勾选。
+    // 默认关闭（设置页可开）：chroma 计算重，首扫慢。
+    if (enableCrossLingual && remaining.length >= 2) {
+      final gs = await _findCrossLingualGroups(
+        remaining,
+        onProgress: onCrossLingualProgress,
+      );
+      final grouped = gs.expand((g) => g.songs.map((s) => s.path)).toSet();
       result.addAll(gs);
+      remaining = remaining.where((s) => !grouped.contains(s.path)).toList();
     }
 
     // 按组大小排序：大组优先
@@ -409,111 +419,6 @@ class SimilarityService {
     }
   }
 
-  // ---------- Tier 5: 音频指纹 ----------
-
-  /// 标题/元数据完全对不上的同音频副本：按时长分桶（±10s），桶内
-  /// 两两比较音频指纹汉明距离，<= 阈值即判同组。指纹按 path+mtime 缓存。
-  static Future<List<DuplicateGroup>> _acousticGroups(
-    List<SongFile> songs, {
-    int bucketMs = 10000,
-    void Function(int done, int total)? onProgress,
-  }) async {
-    if (songs.length < 2) return [];
-    final cache = await AcousticFpCache.load();
-    final buckets = <int, List<SongFile>>{};
-    for (final s in songs) {
-      buckets.putIfAbsent(s.durationMs ~/ bucketMs, () => []).add(s);
-    }
-    final keys = buckets.keys.toList()..sort();
-    final result = <DuplicateGroup>[];
-    final grouped = <String>{};
-    var done = 0;
-    var total = 0;
-    for (var i = 0; i < keys.length; i++) {
-      final window = <SongFile>[];
-      for (var k = i; k <= i + 1 && k < keys.length; k++) {
-        if (keys[k] - keys[i] <= 1) window.addAll(buckets[keys[k]]!);
-      }
-      final local =
-          window.where((s) => !grouped.contains(s.path)).toList();
-      if (local.length >= 2) total += local.length;
-    }
-    onProgress?.call(0, total);
-
-    for (var i = 0; i < keys.length; i++) {
-      final window = <SongFile>[];
-      for (var k = i; k <= i + 1 && k < keys.length; k++) {
-        if (keys[k] - keys[i] <= 1) window.addAll(buckets[keys[k]]!);
-      }
-      final local =
-          window.where((s) => !grouped.contains(s.path)).toList();
-      if (local.length < 2) continue;
-      // 取指纹：缓存优先，miss 才走 native 解码；3 路并行加速
-      // （native 侧每次调用独立线程 + 独立 MediaCodec，并行安全）
-      final fps = <String, String>{};
-      const concurrency = 3;
-      for (var ci = 0; ci < local.length; ci += concurrency) {
-        final end =
-            ci + concurrency < local.length ? ci + concurrency : local.length;
-        final chunk = local.sublist(ci, end);
-        final results = await Future.wait(chunk.map((s) async {
-          var fp = cache.lookup(s.path, s.dateModified);
-          fp ??= await AcousticFingerprintService.fingerprint(s.id, s.path);
-          return MapEntry(s, fp);
-        }));
-        for (final e in results) {
-          final fp = e.value;
-          if (fp != null && fp.isNotEmpty) {
-            cache.store(e.key.path, e.key.dateModified, fp);
-            fps[e.key.path] = fp;
-          }
-          done++;
-          onProgress?.call(done, total);
-        }
-        // 让出 UI 线程
-        await Future.delayed(const Duration(milliseconds: 8));
-      }
-      await cache.save();
-      // 贪心聚类：汉明距离 <= 阈值即同组
-      final visited = <String>{};
-      for (var a = 0; a < local.length; a++) {
-        final pa = local[a].path;
-        if (visited.contains(pa) || !fps.containsKey(pa)) continue;
-        final cur = <SongFile>[local[a]];
-        visited.add(pa);
-        for (var b = a + 1; b < local.length; b++) {
-          final pb = local[b].path;
-          if (visited.contains(pb) || !fps.containsKey(pb)) continue;
-          if ((local[a].durationMs - local[b].durationMs).abs() > bucketMs) {
-            continue;
-          }
-          final d =
-              AcousticFingerprintService.hammingDistance(fps[pa]!, fps[pb]!);
-          debugPrint('[song_dedup] acoustic dist '
-              '${local[a].displayName} vs ${local[b].displayName} = $d');
-          if (AcousticFingerprintService.isSameAudio(fps[pa]!, fps[pb]!)) {
-            cur.add(local[b]);
-            visited.add(pb);
-          }
-        }
-        if (cur.length >= 2) {
-          final sorted = QualityService.sortByQualityDesc(cur);
-          result.add(
-            DuplicateGroup(
-              key: 'acoustic::${fps[sorted.first.path]}',
-              songs: sorted,
-              displayTitle: _displayTitle(sorted.first),
-              reason: '音频指纹相同',
-            ),
-          );
-          grouped.addAll(cur.map((s) => s.path));
-        }
-      }
-    }
-    debugPrint('[song_dedup] acoustic groups=${result.length}');
-    return result;
-  }
-
   // ---------- helpers ----------
 
   /// 归一化文本：小写、去括号内容、去符号空格，只留字母数字。
@@ -632,5 +537,285 @@ class SimilarityService {
       }
     }
     return dp[m][n];
+  }
+
+  /// 同名声学细分阈值：3 段 chroma 余弦均值。
+  /// 实测：同一录音转格式 = 1.0；不同歌曲 <= 0.972。取 0.99，
+  /// 宁可把边界情况判为"不同版本"（不自动删，用户手动看）。
+  static const double _chromaSameAudioThreshold = 0.99;
+
+  /// 对 Tier 1（标题/歌手一致）组做 chroma 细分。
+  /// 同一录音的保留原组；不同版本拆成新组（reason='同名不同版本'，
+  /// noAutoSelect=true）。指纹按 path+mtime 缓存，3 路并行计算。
+  static Future<List<DuplicateGroup>> _subdivideTitleGroupsByChroma(
+    List<DuplicateGroup> groups, {
+    void Function(int done, int total)? onProgress,
+  }) async {
+    final targets = <SongFile>[];
+    for (final g in groups) {
+      if (g.reason == '标题/歌手一致' && g.songs.length >= 2) {
+        targets.addAll(g.songs);
+      }
+    }
+    if (targets.length < 2) return groups;
+
+    final cache = await ChromaFpCache.load();
+    final fps = <String, List<double>>{};
+    final toCompute = <SongFile>[];
+    for (final s in targets) {
+      final hit = cache.lookup(s.path, s.dateModified);
+      if (hit != null) {
+        fps[s.path] = hit;
+      } else {
+        toCompute.add(s);
+      }
+    }
+    var done = targets.length - toCompute.length;
+    onProgress?.call(done, targets.length);
+
+    var dirty = false;
+    await _parallel(toCompute, 3, (s) async {
+      List<double>? fp;
+      try {
+        fp = await ChromaFingerprintService.getChroma(s.id, s.path).timeout(
+            const Duration(seconds: 60), onTimeout: () => null);
+      } catch (_) {
+        fp = null;
+      }
+      if (fp != null) {
+        cache.store(s.path, s.dateModified, fp);
+        dirty = true;
+        fps[s.path] = fp;
+      }
+      done++;
+      onProgress?.call(done, targets.length);
+    });
+    if (dirty) await cache.save();
+
+    final out = <DuplicateGroup>[];
+    for (final g in groups) {
+      if (g.reason != '标题/歌手一致' || g.songs.length < 2) {
+        out.add(g);
+        continue;
+      }
+      final clusters = clusterByChroma(g.songs, fps);
+      if (clusters.length <= 1) {
+        out.add(g);
+        continue;
+      }
+      clusters.sort((a, b) => b.length.compareTo(a.length));
+      out.add(DuplicateGroup(
+        key: g.key,
+        songs: QualityService.sortByQualityDesc(clusters.first),
+        displayTitle: g.displayTitle,
+        reason: g.reason,
+      ));
+      for (var i = 1; i < clusters.length; i++) {
+        out.add(DuplicateGroup(
+          key: '${g.key}::ver$i',
+          songs: QualityService.sortByQualityDesc(clusters[i]),
+          displayTitle: g.displayTitle,
+          reason: '同名不同版本',
+          noAutoSelect: true,
+        ));
+      }
+      debugPrint('[song_dedup] chroma subdivided "${g.displayTitle}": '
+          '${clusters.map((c) => c.length).toList()}');
+    }
+    return out;
+  }
+
+  /// 单链聚类：两两 chroma 相似度 >= 阈值则同簇。
+  /// 指纹缺失的歌曲并入最大簇（无法判断时保守处理，不单独成组）。
+  static List<List<SongFile>> clusterByChroma(
+      List<SongFile> songs, Map<String, List<double>> fps) {
+    final parent = <String, String>{for (final s in songs) s.path: s.path};
+    String find(String x) {
+      var r = x;
+      while (parent[r] != r) {
+        r = parent[r]!;
+      }
+      var c = x;
+      while (parent[c] != r) {
+        final n = parent[c]!;
+        parent[c] = r;
+        c = n;
+      }
+      return r;
+    }
+
+    for (var i = 0; i < songs.length; i++) {
+      final a = fps[songs[i].path];
+      if (a == null) continue;
+      for (var j = i + 1; j < songs.length; j++) {
+        final b = fps[songs[j].path];
+        if (b == null) continue;
+        if (ChromaFingerprintService.similarity(a, b) >=
+            _chromaSameAudioThreshold) {
+          final ra = find(songs[i].path);
+          final rb = find(songs[j].path);
+          if (ra != rb) parent[ra] = rb;
+        }
+      }
+    }
+    final byRoot = <String, List<SongFile>>{};
+    for (final s in songs) {
+      byRoot.putIfAbsent(find(s.path), () => []).add(s);
+    }
+    final clusters = byRoot.values.toList();
+    if (clusters.length <= 1) return clusters;
+    clusters.sort((a, b) => b.length.compareTo(a.length));
+    final main = clusters.first;
+    final rest = <List<SongFile>>[];
+    for (var i = 1; i < clusters.length; i++) {
+      final missing =
+          clusters[i].where((s) => !fps.containsKey(s.path)).toList();
+      final kept = clusters[i].where((s) => fps.containsKey(s.path)).toList();
+      main.addAll(missing);
+      if (kept.isNotEmpty) rest.add(kept);
+    }
+    return [main, ...rest];
+  }
+
+  /// 简单并行：concurrency 个 worker 消费队列。
+  /// Dart 单线程，取任务与自增之间无 await，原子安全。
+  static Future<void> _parallel<T>(
+      List<T> items, int concurrency, Future<void> Function(T) fn) async {
+    if (items.isEmpty) return;
+    var idx = 0;
+    Future<void> worker() async {
+      while (true) {
+        if (idx >= items.length) {
+          return;
+        }
+        final item = items[idx++];
+        await fn(item);
+      }
+    }
+    await Future.wait(List.generate(concurrency, (_) => worker()));
+  }
+
+  /// 跨语言版本检测阈值：3 段 chroma 余弦均值。
+  /// 实测：星间旅行中/英文版（同伴奏）= 0.9937；不同歌曲 <= 0.972。
+  /// 取 0.985，只抓伴奏高度一致的；分组默认不自动勾选，误判用户手动忽略。
+  static const double chromaCrossLingualThreshold = 0.985;
+
+  /// 跨语言版本检测：在未分组歌曲中，找时长接近（<= min(2%, 5000ms)）
+  /// 且 chroma 相似度 >= 0.985 的对，单链聚类成组。
+  /// 只比较时长候选对，不做全量 O(n^2) 声学比对。
+  static Future<List<DuplicateGroup>> _findCrossLingualGroups(
+    List<SongFile> remaining, {
+    void Function(int done, int total)? onProgress,
+  }) async {
+    if (remaining.length < 2) return [];
+
+    // 1. 按时长排序，滑动窗口找候选对
+    final sorted = List<SongFile>.from(remaining)
+      ..sort((a, b) => a.durationMs.compareTo(b.durationMs));
+    final candidatePairs = <List<SongFile>>[];
+    final inCandidate = <String>{};
+    for (var i = 0; i < sorted.length; i++) {
+      for (var j = i + 1; j < sorted.length; j++) {
+        final dd = sorted[j].durationMs - sorted[i].durationMs;
+        final tol =
+            min(3000, (sorted[i].durationMs * 0.01).round()).toInt();
+        if (dd > tol) break;
+        candidatePairs.add([sorted[i], sorted[j]]);
+        inCandidate.add(sorted[i].path);
+        inCandidate.add(sorted[j].path);
+      }
+    }
+    if (candidatePairs.isEmpty) return [];
+
+    // 2. 计算候选歌曲的 chroma 指纹（缓存 + 3 路并行）
+    final cache = await ChromaFpCache.load();
+    final fps = <String, List<double>>{};
+    final toCompute = <SongFile>[];
+    for (final s in sorted) {
+      if (!inCandidate.contains(s.path)) continue;
+      final hit = cache.lookup(s.path, s.dateModified);
+      if (hit != null) {
+        fps[s.path] = hit;
+      } else {
+        toCompute.add(s);
+      }
+    }
+    var done = inCandidate.length - toCompute.length;
+    onProgress?.call(done, inCandidate.length);
+    var dirty = false;
+    await _parallel(toCompute, 3, (s) async {
+      List<double>? fp;
+      try {
+        fp = await ChromaFingerprintService.getChroma(s.id, s.path).timeout(
+            const Duration(seconds: 60), onTimeout: () => null);
+      } catch (_) {
+        fp = null;
+      }
+      if (fp != null) {
+        cache.store(s.path, s.dateModified, fp);
+        dirty = true;
+        fps[s.path] = fp;
+      }
+      done++;
+      onProgress?.call(done, inCandidate.length);
+    });
+    if (dirty) await cache.save();
+
+    // 3. 候选对连边（相似度 >= 阈值），并查集聚类
+    final parent = <String, String>{for (final p in inCandidate) p: p};
+    String find(String x) {
+      var r = x;
+      while (parent[r] != r) {
+        r = parent[r]!;
+      }
+      var c = x;
+      while (parent[c] != r) {
+        final n = parent[c]!;
+        parent[c] = r;
+        c = n;
+      }
+      return r;
+    }
+
+    for (final pair in candidatePairs) {
+      final a = fps[pair[0].path];
+      final b = fps[pair[1].path];
+      if (a == null || b == null) continue;
+      if (ChromaFingerprintService.similarity(a, b) >=
+          chromaCrossLingualThreshold) {
+        final ra = find(pair[0].path);
+        final rb = find(pair[1].path);
+        if (ra != rb) parent[ra] = rb;
+      }
+    }
+
+    final byRoot = <String, List<SongFile>>{};
+    final byPath = {for (final x in sorted) x.path: x};
+    for (final p in inCandidate) {
+      final song = byPath[p];
+      if (song == null) continue;
+      // 指纹缺失的跳过（无法判断，不硬分组）
+      if (!fps.containsKey(p)) continue;
+      byRoot.putIfAbsent(find(p), () => []).add(song);
+    }
+
+    // 4. 成组
+    final out = <DuplicateGroup>[];
+    var idx = 0;
+    for (final cluster in byRoot.values) {
+      if (cluster.length < 2) continue;
+      final ordered = QualityService.sortByQualityDesc(cluster);
+      out.add(DuplicateGroup(
+        key: 'crosslingual::$idx:${ordered.map((e) => e.path).join('|')}',
+        songs: ordered,
+        displayTitle: ordered.first.displayName,
+        reason: '跨语言版本',
+        noAutoSelect: true,
+      ));
+      idx++;
+      debugPrint('[song_dedup] cross-lingual group: '
+          '${ordered.map((e) => e.displayName).join(' / ')}');
+    }
+    return out;
   }
 }

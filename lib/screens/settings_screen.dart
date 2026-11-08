@@ -1,3 +1,4 @@
+import '../services/cache_service.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
@@ -97,27 +98,14 @@ class SettingsScreen extends StatelessWidget {
                             style: TextStyle(
                                 fontSize: 12, color: scheme.onSurfaceVariant),
                           ),
-                          trailing: SegmentedButton<String>(
-                            segments: const [
-                              ButtonSegment(
-                                value: 'quality',
-                                label:
-                                    Text('音质优先', style: TextStyle(fontSize: 12)),
-                              ),
-                              ButtonSegment(
-                                value: 'lossless',
-                                label:
-                                    Text('优先无损', style: TextStyle(fontSize: 12)),
-                              ),
-                              ButtonSegment(
-                                value: 'dir',
-                                label:
-                                    Text('优先目录', style: TextStyle(fontSize: 12)),
-                              ),
-                            ],
-                            selected: {rule},
-                            onSelectionChanged: (sel) async {
-                              final r = sel.first;
+                          trailing: _M3Dropdown<String>(
+                            value: rule,
+                            options: const {
+                              'quality': '音质优先',
+                              'lossless': '优先无损',
+                              'dir': '优先目录',
+                            },
+                            onChanged: (r) async {
                               keepRuleNotifier.value = r;
                               if (r == 'dir') {
                                 final d = await FilePicker.platform
@@ -125,11 +113,6 @@ class SettingsScreen extends StatelessWidget {
                                 if (d != null) keepDirNotifier.value = d;
                               }
                             },
-                            showSelectedIcon: false,
-                            style: const ButtonStyle(
-                              visualDensity: VisualDensity.compact,
-                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                            ),
                           ),
                           onTap: rule == 'dir'
                               ? () async {
@@ -240,33 +223,18 @@ class SettingsScreen extends StatelessWidget {
                       ),
                     ),
           ValueListenableBuilder<bool>(
-                      valueListenable: acousticFpEnabledNotifier,
+                      valueListenable: crossLingualEnabledNotifier,
                       builder: (context, enabled, _) => SwitchListTile(
-                        title: const Text('音频指纹识别'),
+                        title: const Text('跨语言版本匹配'),
                         subtitle: Text(
                           enabled
-                              ? '已开启：标题完全不同的同音频副本也能认出，扫描稍慢'
-                              : '已关闭：跳过声音内容比对，扫描更快',
+                              ? '已开启：用声学指纹找伴奏相同、语言不同的版本，扫描明显变慢'
+                              : '已关闭：跳过跨语言声学比对，扫描更快',
                           style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
                         ),
                         value: enabled,
-                        onChanged: (v) => acousticFpEnabledNotifier.value = v,
-                        secondary: const Icon(Icons.audio_file_rounded),
-                      ),
-                    ),
-          ValueListenableBuilder<bool>(
-                      valueListenable: batchSpectrumNotifier,
-                      builder: (context, enabled, _) => SwitchListTile(
-                        title: const Text('批量检测假无损'),
-                        subtitle: Text(
-                          enabled
-                              ? '已开启：扫描后后台检测无损文件，结果页标记疑似假无损'
-                              : '已关闭：只在文件详情里手动检测',
-                          style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
-                        ),
-                        value: enabled,
-                        onChanged: (v) => batchSpectrumNotifier.value = v,
-                        secondary: const Icon(Icons.graphic_eq_rounded),
+                        onChanged: (v) => crossLingualEnabledNotifier.value = v,
+                        secondary: const Icon(Icons.translate_rounded),
                       ),
                     ),
           _SectionHeader(title: '回收站'),
@@ -281,24 +249,21 @@ class SettingsScreen extends StatelessWidget {
                               : '超过 $days 天的回收站记录自动删除',
                           style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
                         ),
-                        trailing: DropdownButton<int>(
+                        trailing: _M3Dropdown<int>(
                           value: days,
-                          underline: const SizedBox.shrink(),
-                          style: const TextStyle(fontSize: 13),
-                          items: const [
-                            DropdownMenuItem(value: 0, child: Text('永不')),
-                            DropdownMenuItem(value: 7, child: Text('7天')),
-                            DropdownMenuItem(value: 14, child: Text('14天')),
-                            DropdownMenuItem(value: 30, child: Text('30天')),
-                          ],
-                          onChanged: (v) {
-                            if (v != null) {
-                              trashRetentionDaysNotifier.value = v;
-                            }
+                          options: const {
+                            0: '永不',
+                            7: '7天',
+                            14: '14天',
+                            30: '30天',
                           },
+                          onChanged: (v) =>
+                              trashRetentionDaysNotifier.value = v,
                         ),
                       ),
                     ),
+          _SectionHeader(title: '缓存'),
+          const _CacheTile(),
           _SectionHeader(title: '外观'),
           ValueListenableBuilder<ThemeMode>(
                       valueListenable: themeModeNotifier,
@@ -342,6 +307,134 @@ class SettingsScreen extends StatelessWidget {
 
 
 /// 设置页分组标题
+/// 与应用 M3 风格统一的下拉框：tonal 圆角背景 + 统一字色，
+/// 替代裸 DropdownButton（无边框无底色，与圆角卡片/按钮不搭）。
+class _M3Dropdown<T> extends StatelessWidget {
+  final T value;
+  final Map<T, String> options;
+  final ValueChanged<T> onChanged;
+
+  const _M3Dropdown({
+    required this.value,
+    required this.options,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      decoration: BoxDecoration(
+        color: scheme.secondaryContainer,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: DropdownButton<T>(
+        value: value,
+        underline: const SizedBox.shrink(),
+        dropdownColor: scheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(12),
+        icon: Icon(Icons.arrow_drop_down_rounded,
+            color: scheme.onSecondaryContainer),
+        style: TextStyle(
+          fontSize: 13,
+          color: scheme.onSecondaryContainer,
+          fontWeight: FontWeight.w500,
+        ),
+        items: [
+          for (final e in options.entries)
+            DropdownMenuItem(
+              value: e.key,
+              child: Text(e.value,
+                  style: TextStyle(color: scheme.onSurface)),
+            ),
+        ],
+        onChanged: (v) {
+          if (v != null) onChanged(v);
+        },
+      ),
+    );
+  }
+}
+
+/// 缓存行：显示扫描缓存大小，一键清除（含确认框）
+class _CacheTile extends StatefulWidget {
+  const _CacheTile();
+
+  @override
+  State<_CacheTile> createState() => _CacheTileState();
+}
+
+class _CacheTileState extends State<_CacheTile> {
+  int? _bytes;
+
+  @override
+  void initState() {
+    super.initState();
+    _reload();
+  }
+
+  Future<void> _reload() async {
+    final b = await CacheService.sizeBytes();
+    if (mounted) setState(() => _bytes = b);
+  }
+
+  String _fmt(int b) {
+    if (b < 1024) return '$b B';
+    if (b < 1024 * 1024) return '${(b / 1024).toStringAsFixed(1)} KB';
+    return '${(b / 1024 / 1024).toStringAsFixed(1)} MB';
+  }
+
+  Future<void> _confirmClear() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('清除扫描缓存？'),
+        content: const Text(
+            '将删除文件指纹、声学指纹、封面/歌词三项缓存。'
+            '下次扫描会重新计算、慢一些，但扫描结果不受影响。'
+            '回收站和各项设置不会被清除。'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(c, false),
+              child: const Text('取消')),
+          FilledButton(
+              onPressed: () => Navigator.pop(c, true),
+              child: const Text('清除')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final freed = await CacheService.clearAll();
+    await _reload();
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已清除扫描缓存，释放 ${_fmt(freed)}')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final b = _bytes;
+    return ListTile(
+      leading: const Icon(Icons.cached_rounded),
+      title: const Text('清除扫描缓存'),
+      subtitle: Text(
+        b == null
+            ? '正在统计…'
+            : '当前缓存 ${_fmt(b)}，清除后下次扫描变慢，结果不受影响',
+        style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+      ),
+      trailing: TextButton(
+        onPressed: (b != null && b > 0) ? _confirmClear : null,
+        child: const Text('清除'),
+      ),
+    );
+  }
+}
+
 class _SectionHeader extends StatelessWidget {
   final String title;
   const _SectionHeader({required this.title});

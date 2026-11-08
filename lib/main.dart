@@ -1,4 +1,7 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'screens/home_screen.dart';
 import 'services/ignore_service.dart';
@@ -8,6 +11,8 @@ import 'services/trash_service.dart';
 final ValueNotifier<ThemeMode> themeModeNotifier = ValueNotifier(ThemeMode.system);
 /// 声纹开关（设置页可自由开启）
 final ValueNotifier<bool> fingerprintEnabledNotifier = ValueNotifier(true);
+/// 跨语言版本匹配开关：默认关闭（chroma 计算重，扫描慢），需要时手动开。
+final ValueNotifier<bool> crossLingualEnabledNotifier = ValueNotifier(false);
 /// 扫描范围：true=扫描全部目录（默认）；false=仅扫描 scanDirs 中的目录（前缀匹配）。
 /// 清单语义：勾上就是扫，不勾就是不扫。
 final ValueNotifier<bool> scanAllDirsNotifier = ValueNotifier(true);
@@ -21,10 +26,6 @@ final ValueNotifier<String> keepDirNotifier = ValueNotifier('');
 /// 自动扫描：启动时若距离上次扫描超过 N 天则自动扫描
 final ValueNotifier<bool> autoScanNotifier = ValueNotifier(false);
 final ValueNotifier<int> autoScanDaysNotifier = ValueNotifier(7);
-/// 音频指纹开关：识别标题完全不同的同音频副本，解码开销大，默认开启
-final ValueNotifier<bool> acousticFpEnabledNotifier = ValueNotifier(true);
-/// 扫描后批量检测假无损：后台逐个解码无损文件，结果页打徽章
-final ValueNotifier<bool> batchSpectrumNotifier = ValueNotifier(true);
 /// 回收站自动清理：超过 N 天的记录自动删除，0=永不
 final ValueNotifier<int> trashRetentionDaysNotifier = ValueNotifier(30);
 
@@ -32,6 +33,8 @@ Future<void> _loadSettings() async {
   final prefs = await SharedPreferences.getInstance();
   final fp = prefs.getBool('fingerprint_enabled');
   if (fp != null) fingerprintEnabledNotifier.value = fp;
+  final cl = prefs.getBool('crosslingual_enabled');
+  if (cl != null) crossLingualEnabledNotifier.value = cl;
   final tm = prefs.getString('theme_mode');
   if (tm != null) {
     themeModeNotifier.value = switch (tm) {
@@ -72,14 +75,13 @@ Future<void> _loadSettings() async {
   autoScanNotifier.value = prefs.getBool('auto_scan') ?? false;
   final asd = prefs.getInt('auto_scan_days');
   if (asd == 7 || asd == 14 || asd == 30) autoScanDaysNotifier.value = asd!;
-  final afp = prefs.getBool('acoustic_fp_enabled');
-  if (afp != null) acousticFpEnabledNotifier.value = afp;
-  final bs = prefs.getBool('batch_spectrum');
-  if (bs != null) batchSpectrumNotifier.value = bs;
   final tr = prefs.getInt('trash_retention_days');
   if (tr != null && tr >= 0) trashRetentionDaysNotifier.value = tr;
   fingerprintEnabledNotifier.addListener(() {
     SharedPreferences.getInstance().then((p) => p.setBool('fingerprint_enabled', fingerprintEnabledNotifier.value));
+  });
+  crossLingualEnabledNotifier.addListener(() {
+    SharedPreferences.getInstance().then((p) => p.setBool('crosslingual_enabled', crossLingualEnabledNotifier.value));
   });
   themeModeNotifier.addListener(() {
     final v = switch (themeModeNotifier.value) {
@@ -110,21 +112,36 @@ Future<void> _loadSettings() async {
   autoScanDaysNotifier.addListener(() {
     SharedPreferences.getInstance().then((p) => p.setInt('auto_scan_days', autoScanDaysNotifier.value));
   });
-  acousticFpEnabledNotifier.addListener(() {
-    SharedPreferences.getInstance().then((p) => p.setBool('acoustic_fp_enabled', acousticFpEnabledNotifier.value));
-  });
-  batchSpectrumNotifier.addListener(() {
-    SharedPreferences.getInstance().then((p) => p.setBool('batch_spectrum', batchSpectrumNotifier.value));
-  });
   trashRetentionDaysNotifier.addListener(() {
     SharedPreferences.getInstance().then((p) => p.setInt('trash_retention_days', trashRetentionDaysNotifier.value));
   });
+}
+
+/// 删除已下线功能的残留缓存文件（只跑一次，文件不存在则跳过）。
+Future<void> _cleanOrphanCaches() async {
+  try {
+    final dir = await getApplicationDocumentsDirectory();
+    for (final name in [
+      'acoustic_fp_cache.json', // 音频指纹（已移除）
+      'spectrum_cache.json', // 假无损频谱检测（已移除）
+      'scan_cache.json', // 启动恢复扫描结果（已移除）
+    ]) {
+      final f = File('${dir.path}/$name');
+      if (await f.exists()) {
+        await f.delete();
+        debugPrint('[song_dedup] removed orphan cache $name');
+      }
+    }
+  } catch (_) {}
 }
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await _loadSettings();
   await IgnoreService.load();
+  _cleanOrphanCaches();
+  // 清扫回收站孤儿文件（历史恢复 bug 留下的无记录副本），不阻塞启动
+  TrashService.sweepOrphans();
   // 回收站过期自动清理（不阻塞启动）
   final retentionDays = trashRetentionDaysNotifier.value;
   if (retentionDays > 0) {

@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
@@ -192,7 +193,10 @@ class TrashService {
             await const MethodChannel('song_dedup/scanner')
                 .invokeMethod('scanFile', {'path': r.originalPath});
           } catch (_) {}
-          // 保留 trash 副本直到用户手动清理
+          // 恢复成功：删掉回收站副本，避免孤儿文件堆积
+          try {
+            await trashFile.delete();
+          } catch (_) {}
           restored++;
         }
       } catch (_) {}
@@ -201,6 +205,44 @@ class TrashService {
     list.removeWhere((e) => batch.contains(e));
     await log.writeAsString(jsonEncode(list));
     return restored;
+  }
+
+  /// 清扫孤儿文件：trash 目录下存在、但日志里没有记录的文件。
+  /// （历史 bug：恢复时只删记录不删文件，导致这类文件越堆越多。）
+  /// 返回释放的字节数。
+  static Future<int> sweepOrphans() async {
+    try {
+      final dir = await _trashDir();
+      final log = await _logFile();
+      final known = <String>{};
+      if (await log.exists()) {
+        try {
+          final list = jsonDecode(await log.readAsString()) as List;
+          for (final e in list) {
+            known.add(
+                Map<String, dynamic>.from(e)['trashPath'] as String? ?? '');
+          }
+        } catch (_) {}
+      }
+      var freed = 0;
+      await for (final ent in dir.list()) {
+        if (ent is! File) continue;
+        final name = ent.path.split('/').last;
+        if (name == _logName || name == '.nomedia') continue;
+        if (!known.contains(ent.path)) {
+          try {
+            freed += await ent.length();
+            await ent.delete();
+          } catch (_) {}
+        }
+      }
+      if (freed > 0) {
+        debugPrint('[song_dedup] trash orphans swept: $freed bytes');
+      }
+      return freed;
+    } catch (_) {
+      return 0;
+    }
   }
 
   /// 导出清单到 Download/清聆_回收站/清单
@@ -257,6 +299,10 @@ class TrashService {
       try {
         await const MethodChannel('song_dedup/scanner')
             .invokeMethod('scanFile', {'path': r.originalPath});
+      } catch (_) {}
+      // 恢复成功：文件已回曲库，删除回收站副本，避免孤儿文件堆积
+      try {
+        await trashFile.delete();
       } catch (_) {}
       // 从日志移除
       final log = await _logFile();

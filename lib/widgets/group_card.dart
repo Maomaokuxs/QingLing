@@ -18,8 +18,6 @@ class GroupCard extends StatefulWidget {
   final void Function(SongFile) onPreview;
   final VoidCallback onCompare;
   final int freeBytes;
-  /// 假无损批量检测结果：path -> 是否疑似
-  final Map<String, bool> fakeLossless;
   final Map<String, bool> hasCover;
   final Map<String, bool> hasLyrics;
 
@@ -37,7 +35,6 @@ class GroupCard extends StatefulWidget {
     required this.onPreview,
     required this.onCompare,
     required this.freeBytes,
-    this.fakeLossless = const {},
     this.hasCover = const {},
     this.hasLyrics = const {},
   });
@@ -198,37 +195,6 @@ class _GroupCardState extends State<GroupCard> {
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                if (widget.fakeLossless[s.path] == true)
-                  Padding(
-                    padding: const EdgeInsets.only(right: 4),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 6, vertical: 2),
-                      decoration: BoxDecoration(
-                        color: _warnColor(context).withValues(alpha: 0.15),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            Icons.warning_amber_rounded,
-                            size: 10,
-                            color: _warnColor(context),
-                          ),
-                          const SizedBox(width: 2),
-                          Text(
-                            '疑似假无损',
-                            style: TextStyle(
-                              fontSize: 10,
-                              fontWeight: FontWeight.bold,
-                              color: _warnColor(context),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
                 if (widget.hasCover[s.path] == true)
                   const Padding(
                     padding: EdgeInsets.only(right: 4),
@@ -368,9 +334,4 @@ String _fmtBytes(int b) {
     return '${(b / 1024 / 1024).toStringAsFixed(1)} MB';
   }
   return '${(b / 1024 / 1024 / 1024).toStringAsFixed(2)} GB';
-}
-
-Color _warnColor(BuildContext context) {
-  final dark = Theme.of(context).brightness == Brightness.dark;
-  return dark ? const Color(0xFFFFB74D) : Colors.orange.shade800;
 }

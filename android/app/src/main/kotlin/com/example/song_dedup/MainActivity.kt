@@ -38,22 +38,6 @@ class MainActivity : FlutterActivity() {
                     Log.d("song_dedup", "DEBUG_SCAN received, channel=${if (debugChannel == null) "null" else "ok"}")
                     debugChannel?.invokeMethod("startScan", null)
                 }
-                "com.example.song_dedup.DEBUG_FINGERPRINT" -> {
-                    val path = intent.getStringExtra("path")
-                    val id = intent.getLongExtra("id", 0L)
-                    if (path != null) {
-                        Thread {
-                            try {
-                                val fp = doAudioFingerprint(id, path)
-                                Log.d("song_dedup",
-                                    "DEBUG_FINGERPRINT $path -> ${fp["fingerprint"]}")
-                            } catch (e: Exception) {
-                                Log.d("song_dedup",
-                                    "DEBUG_FINGERPRINT error: ${e.message}")
-                            }
-                        }.start()
-                    }
-                }
             }
         }
     }
@@ -84,7 +68,6 @@ class MainActivity : FlutterActivity() {
         debugChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "song_dedup/debug")
         val debugFilter = IntentFilter().apply {
             addAction("com.example.song_dedup.DEBUG_SCAN")
-            addAction("com.example.song_dedup.DEBUG_FINGERPRINT")
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(debugReceiver, debugFilter, Context.RECEIVER_EXPORTED) // debug receiver for adb testing; must be exported to receive shell broadcasts
@@ -127,19 +110,11 @@ class MainActivity : FlutterActivity() {
                     } else {
                         result.error("ARG_ERROR", "path null", null)
                     }
-                } else if (call.method == "analyzeSpectrum") {
+                } else if (call.method == "chromaFingerprint") {
                     val id = call.argument<Number>("id")?.toLong() ?: 0L
                     val path = call.argument<String>("path")
                     if (path != null) {
-                        analyzeSpectrum(id, path, result)
-                    } else {
-                        result.error("ARG_ERROR", "path null", null)
-                    }
-                } else if (call.method == "audioFingerprint") {
-                    val id = call.argument<Number>("id")?.toLong() ?: 0L
-                    val path = call.argument<String>("path")
-                    if (path != null) {
-                        audioFingerprint(id, path, result)
+                        chromaFingerprint(id, path, result)
                     } else {
                         result.error("ARG_ERROR", "path null", null)
                     }
@@ -234,8 +209,6 @@ class MainActivity : FlutterActivity() {
                     map["displayName"] = it.getString(nameCol) ?: ""
                     map["size"] = it.getLong(sizeCol)
                     map["path"] = it.getString(dataCol) ?: ""
-                    map["dateModified"] =
-                        if (dateModifiedCol != -1) it.getLong(dateModifiedCol) else 0L
                     list.add(map)
                 }
             }
@@ -341,6 +314,8 @@ class MainActivity : FlutterActivity() {
                     map["duration"] = it.getLong(durationCol).toInt()
                     map["size"] = it.getLong(sizeCol).toInt()
                     map["path"] = it.getString(dataCol) ?: ""
+                    map["dateModified"] =
+                        if (dateModifiedCol != -1) it.getLong(dateModifiedCol) else 0L
                     map["bitrate"] = if (bitrateCol != -1) it.getInt(bitrateCol) else 0
                     list.add(map)
                 }
@@ -440,9 +415,52 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    /// 解码 path 在 seekFraction（0.0~1.0）位置附近 maxSeconds 秒的单声道 PCM。
-    /// 供音频指纹使用；与 doAnalyzeSpectrum 的解码逻辑一致，
-    /// 独立实现以避免改动现有频谱流程。
+    /// 封面/歌词检测：内嵌封面 via MediaMetadataRetriever(FD)；
+    /// 同目录同名 .lrc 是否被 MediaStore 索引。跑在后台线程。
+    private fun mediaTags(id: Long, path: String, result: MethodChannel.Result) {
+        Thread {
+            try {
+                result.success(doMediaTags(id, path))
+            } catch (e: Exception) {
+                result.error("TAGS_ERROR", e.message, null)
+            }
+        }.start()
+    }
+
+    private fun doMediaTags(id: Long, path: String): Map<String, Any> {
+        var hasCover = false
+        try {
+            val pfd = openAudioFdById(id) ?: openAudioFd(path)
+            if (pfd != null) {
+                val mmr = MediaMetadataRetriever()
+                try {
+                    mmr.setDataSource(pfd.fileDescriptor)
+                    hasCover = mmr.embeddedPicture != null
+                } finally {
+                    try { mmr.release() } catch (_: Exception) {}
+                    try { pfd.close() } catch (_: Exception) {}
+                }
+            }
+        } catch (_: Exception) { }
+        var hasLyrics = false
+        try {
+            val dot = path.lastIndexOf('.')
+            val base = if (dot > 0) path.substring(0, dot) else path
+            val lrcPath = "$base.lrc"
+            val uri = MediaStore.Files.getContentUri("external")
+            contentResolver.query(
+                uri,
+                arrayOf(MediaStore.Files.FileColumns._ID),
+                "${MediaStore.Files.FileColumns.DATA} = ?",
+                arrayOf(lrcPath),
+                null
+            )?.use {
+                hasLyrics = it.count > 0
+            }
+        } catch (_: Exception) { }
+        return mapOf("hasCover" to hasCover, "hasLyrics" to hasLyrics)
+    }
+
     private data class MonoSegment(val samples: FloatArray, val filled: Int, val sampleRate: Int)
 
     private fun decodeMonoSegment(id: Long, path: String, seekFraction: Double, maxSeconds: Int): MonoSegment {
@@ -557,294 +575,6 @@ class MainActivity : FlutterActivity() {
         return MonoSegment(mono, filled, sampleRate)
     }
 
-    /// 音频指纹：3 段 × 32 位频谱感知哈希，共 96 位，hex 编码。
-    ///
-    /// 同一音频转不同格式/码率后频谱形状基本不变，
-    /// 汉明距离很小；不同歌曲的距离接近随机（~48 位）。
-    /// 用于识别标题完全不同的同音频副本。
-    private fun doAudioFingerprint(id: Long, path: String): Map<String, Any> {
-        val bits = StringBuilder()
-        var windows = 0
-        for (frac in doubleArrayOf(0.25, 0.5, 0.75)) {
-            val seg = decodeMonoSegment(id, path, frac, 5)
-            if (seg.filled < 4096) continue
-            val n = 4096
-            val hann = DoubleArray(n) { i ->
-                0.5 * (1.0 - kotlin.math.cos(2 * kotlin.math.PI * i / n))
-            }
-            val binHz = seg.sampleRate.toDouble() / n
-            val magAvg = DoubleArray(n / 2)
-            var w = 0
-            var pos = 0
-            val re = DoubleArray(n)
-            val im = DoubleArray(n)
-            while (pos + n <= seg.filled) {
-                for (i in 0 until n) {
-                    re[i] = seg.samples[pos + i] * hann[i]
-                    im[i] = 0.0
-                }
-                fft(re, im, n)
-                for (b in 1 until n / 2) {
-                    magAvg[b] += re[b] * re[b] + im[b] * im[b]
-                }
-                w++
-                pos += n / 2
-            }
-            if (w == 0) continue
-            windows += w
-            // 32 个对数频带 80Hz~16kHz，能量高于均值的记 1
-            val bands = 32
-            val lo = 80.0
-            val hi = 16000.0
-            val bandE = DoubleArray(bands)
-            for (i in 0 until bands) {
-                val f0 = lo * Math.pow(hi / lo, i.toDouble() / bands)
-                val f1 = lo * Math.pow(hi / lo, (i + 1).toDouble() / bands)
-                val b0 = (f0 / binHz).toInt().coerceIn(1, n / 2 - 1)
-                val b1 = (f1 / binHz).toInt().coerceIn(1, n / 2 - 1)
-                var e = 0.0
-                for (b in b0..b1) e += magAvg[b]
-                bandE[i] = e
-            }
-            val mean = bandE.average()
-            var acc = 0L
-            for (i in 0 until bands) {
-                acc = acc shl 1
-                if (bandE[i] > mean) acc = acc or 1L
-            }
-            // 掩到32位，避免负数扩展成16位 hex
-            bits.append(java.lang.Long.toHexString(acc and 0xFFFFFFFFL).padStart(8, '0'))
-        }
-        if (bits.isEmpty()) throw IllegalStateException("decoded too few samples")
-        return mapOf("fingerprint" to bits.toString(), "windows" to windows)
-    }
-
-    private fun audioFingerprint(id: Long, path: String, result: MethodChannel.Result) {
-        Thread {
-            try {
-                result.success(doAudioFingerprint(id, path))
-            } catch (e: Exception) {
-                result.error("FINGERPRINT_ERROR", e.message, null)
-            }
-        }.start()
-    }
-
-    /// 频谱分析（假无损检测）：解码中间 15 秒，分窗 FFT，
-    /// 返回 99% 能量滚降频率 rolloffHz 与 18kHz 以上能量占比。
-    /// 真无损滚降一般 ≥20kHz；MP3 转制的"假 FLAC"通常在 16kHz 附近被一刀切。
-    /// 解码开销大，跑在后台线程。
-    /// 封面/歌词检测：内嵌封面 via MediaMetadataRetriever(FD)；
-    /// 同目录同名 .lrc 是否被 MediaStore 索引。跑在后台线程。
-    private fun mediaTags(id: Long, path: String, result: MethodChannel.Result) {
-        Thread {
-            try {
-                result.success(doMediaTags(id, path))
-            } catch (e: Exception) {
-                result.error("TAGS_ERROR", e.message, null)
-            }
-        }.start()
-    }
-
-    private fun doMediaTags(id: Long, path: String): Map<String, Any> {
-        var hasCover = false
-        try {
-            val pfd = openAudioFdById(id) ?: openAudioFd(path)
-            if (pfd != null) {
-                val mmr = MediaMetadataRetriever()
-                try {
-                    mmr.setDataSource(pfd.fileDescriptor)
-                    hasCover = mmr.embeddedPicture != null
-                } finally {
-                    try { mmr.release() } catch (_: Exception) {}
-                    try { pfd.close() } catch (_: Exception) {}
-                }
-            }
-        } catch (_: Exception) { }
-        var hasLyrics = false
-        try {
-            val dot = path.lastIndexOf('.')
-            val base = if (dot > 0) path.substring(0, dot) else path
-            val lrcPath = "$base.lrc"
-            val uri = MediaStore.Files.getContentUri("external")
-            contentResolver.query(
-                uri,
-                arrayOf(MediaStore.Files.FileColumns._ID),
-                "${MediaStore.Files.FileColumns.DATA} = ?",
-                arrayOf(lrcPath),
-                null
-            )?.use {
-                hasLyrics = it.count > 0
-            }
-        } catch (_: Exception) { }
-        return mapOf("hasCover" to hasCover, "hasLyrics" to hasLyrics)
-    }
-
-    private fun analyzeSpectrum(id: Long, path: String, result: MethodChannel.Result) {
-        Thread {
-            try {
-                result.success(doAnalyzeSpectrum(id, path))
-            } catch (e: Exception) {
-                result.error("SPECTRUM_ERROR", e.message, null)
-            }
-        }.start()
-    }
-
-    private fun doAnalyzeSpectrum(id: Long, path: String): Map<String, Any> {
-        val pfd = openAudioFdById(id) ?: openAudioFd(path)
-        val extractor = MediaExtractor()
-        if (pfd != null) {
-            extractor.setDataSource(pfd.fileDescriptor)
-        } else {
-            extractor.setDataSource(path)
-        }
-        val trackIndex = (0 until extractor.trackCount).firstOrNull {
-            (extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME) ?: "")
-                .startsWith("audio/")
-        } ?: throw IllegalArgumentException("no audio track")
-        extractor.selectTrack(trackIndex)
-        val format = extractor.getTrackFormat(trackIndex)
-        val mime = format.getString(MediaFormat.KEY_MIME)!!
-        val sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-        val channelCount = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-        val durationUs = if (format.containsKey(MediaFormat.KEY_DURATION)) {
-            format.getLong(MediaFormat.KEY_DURATION)
-        } else {
-            0L
-        }
-
-        val codec = MediaCodec.createDecoderByType(mime)
-        codec.configure(format, null, null, 0)
-        codec.start()
-        // TODO: 从中间 seek 在某些 FLAC 上会导致解码卡住，暂时从头解码
-        val maxSamples = sampleRate * 15
-        val mono = FloatArray(maxSamples)
-        var filled = 0
-        val info = MediaCodec.BufferInfo()
-        var sawEos = false
-        var outEncoding = AudioFormat.ENCODING_PCM_16BIT
-        var guard = 0
-        while (!sawEos && filled < maxSamples && guard++ < 20000) {
-            val inIndex = codec.dequeueInputBuffer(10000)
-            if (inIndex >= 0) {
-                val ib = codec.getInputBuffer(inIndex)!!
-                val n = extractor.readSampleData(ib, 0)
-                if (n < 0) {
-                    codec.queueInputBuffer(inIndex, 0, 0, 0,
-                        MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                } else {
-                    codec.queueInputBuffer(inIndex, 0, n, extractor.sampleTime, 0)
-                    extractor.advance()
-                }
-            }
-            val outIndex = codec.dequeueOutputBuffer(info, 10000)
-            if (outIndex >= 0) {
-                val ob = codec.getOutputBuffer(outIndex)!!
-                if (info.size > 0 &&
-                    info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM == 0) {
-                    if (outEncoding == AudioFormat.ENCODING_PCM_FLOAT) {
-                        val fb = ob.asFloatBuffer()
-                        val tmp = FloatArray(info.size / 4)
-                        fb.get(tmp)
-                        var i = 0
-                        while (i < tmp.size && filled < maxSamples) {
-                            var sum = 0f
-                            for (ch in 0 until channelCount) {
-                                val idx = i + ch
-                                if (idx < tmp.size) sum += tmp[idx]
-                            }
-                            mono[filled++] = sum / channelCount
-                            i += channelCount
-                        }
-                    } else {
-                        val sb = ob.asShortBuffer()
-                        val tmp = ShortArray(info.size / 2)
-                        sb.get(tmp)
-                        var i = 0
-                        while (i < tmp.size && filled < maxSamples) {
-                            var sum = 0f
-                            for (ch in 0 until channelCount) {
-                                val idx = i + ch
-                                if (idx < tmp.size) sum += tmp[idx] / 32768f
-                            }
-                            mono[filled++] = sum / channelCount
-                            i += channelCount
-                        }
-                    }
-                }
-                codec.releaseOutputBuffer(outIndex, false)
-                if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
-                    sawEos = true
-                }
-            } else if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                try {
-                    val of = codec.outputFormat
-                    if (of.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
-                        outEncoding = of.getInteger(MediaFormat.KEY_PCM_ENCODING)
-                    }
-                } catch (_: Exception) {
-                }
-            }
-        }
-        try {
-            codec.stop()
-        } catch (_: Exception) {
-        }
-        codec.release()
-        extractor.release()
-        try { pfd?.close() } catch (_: Exception) {}
-
-        if (filled < 4096) throw IllegalStateException("decoded too few samples")
-
-        // 分窗 FFT：4096 点 Hann 窗，50% 重叠
-        val n = 4096
-        val hann = DoubleArray(n) { i ->
-            0.5 * (1.0 - kotlin.math.cos(2 * kotlin.math.PI * i / n))
-        }
-        val binHz = sampleRate.toDouble() / n
-        val magAvg = DoubleArray(n / 2)
-        var windows = 0
-        var pos = 0
-        val re = DoubleArray(n)
-        val im = DoubleArray(n)
-        while (pos + n <= filled) {
-            for (i in 0 until n) {
-                re[i] = mono[pos + i] * hann[i]
-                im[i] = 0.0
-            }
-            fft(re, im, n)
-            for (b in 1 until n / 2) {
-                magAvg[b] += re[b] * re[b] + im[b] * im[b]
-            }
-            windows++
-            pos += n / 2
-        }
-        var total = 0.0
-        for (b in 1 until n / 2) {
-            magAvg[b] /= windows
-            total += magAvg[b]
-        }
-        // 99% 能量滚降频率
-        var acc = 0.0
-        var rolloffBin = n / 2 - 1
-        for (b in 1 until n / 2) {
-            acc += magAvg[b]
-            if (acc >= total * 0.99) {
-                rolloffBin = b
-                break
-            }
-        }
-        val highBin = (18000.0 / binHz).toInt().coerceIn(1, n / 2 - 1)
-        var high = 0.0
-        for (b in highBin until n / 2) high += magAvg[b]
-        return mapOf(
-            "sampleRate" to sampleRate,
-            "rolloffHz" to (rolloffBin * binHz).toInt(),
-            "highFreqRatio" to if (total > 0) high / total else 0.0,
-            "windows" to windows
-        )
-    }
-
-    /// 基2迭代 FFT，原地计算
     private fun fft(re: DoubleArray, im: DoubleArray, n: Int) {
         var j = 0
         for (i in 1 until n) {
@@ -887,6 +617,72 @@ class MainActivity : FlutterActivity() {
             }
             len = len shl 1
         }
+    }
+
+
+    /// Chroma 指纹：3 段 × 12 维音高类别能量向量，共 36 个 float（L2 归一化）。
+    ///
+    /// 同一录音转不同格式后 chroma 几乎不变；不同录音（现场版/重制版/不同歌）
+    /// 的音高分布不同。只在同名组内做细分，不做全库比对。
+    private fun chromaFingerprint(id: Long, path: String, result: MethodChannel.Result) {
+        Thread {
+            try {
+                result.success(doChromaFingerprint(id, path))
+            } catch (e: Exception) {
+                result.error("CHROMA_ERROR", e.message, null)
+            }
+        }.start()
+    }
+
+    private fun doChromaFingerprint(id: Long, path: String): Map<String, Any> {
+        val out = mutableListOf<Double>()
+        var windows = 0
+        for (f in doubleArrayOf(0.25, 0.5, 0.75)) {
+            val seg = decodeMonoSegment(id, path, f, 5)
+            out.addAll(chromaOfSegment(seg).toList())
+            windows++
+        }
+        return mapOf("chroma" to out, "windows" to windows)
+    }
+
+    /// 单段 5 秒音频的 12 维 chroma 向量（L2 归一化）。
+    /// 分窗 4096 Hann + FFT，频点按最近 MIDI 音高折叠到 12 音级，
+    /// 只统计 55Hz~4kHz（音乐音高主要区间）。
+    private fun chromaOfSegment(seg: MonoSegment): DoubleArray {
+        val n = 4096
+        val hop = 2048
+        val chroma = DoubleArray(12)
+        val re = DoubleArray(n)
+        val im = DoubleArray(n)
+        val win = DoubleArray(n) { i ->
+            0.5 - 0.5 * kotlin.math.cos(2.0 * kotlin.math.PI * i / (n - 1))
+        }
+        var pos = 0
+        var frames = 0
+        while (pos + n <= seg.filled) {
+            for (i in 0 until n) {
+                re[i] = seg.samples[pos + i] * win[i]
+                im[i] = 0.0
+            }
+            fft(re, im, n)
+            for (b in 1 until n / 2) {
+                val mag = kotlin.math.sqrt(re[b] * re[b] + im[b] * im[b])
+                if (mag <= 0.0) continue
+                val freq = b * seg.sampleRate.toDouble() / n
+                if (freq < 55.0 || freq > 4096.0) continue
+                val midi = 69.0 + 12.0 * kotlin.math.log2(freq / 440.0)
+                val pc = ((kotlin.math.round(midi).toInt() % 12) + 12) % 12
+                chroma[pc] += mag
+            }
+            pos += hop
+            frames++
+        }
+        if (frames == 0) throw IllegalStateException("decoded too few samples")
+        var norm = 0.0
+        for (v in chroma) norm += v * v
+        norm = kotlin.math.sqrt(norm)
+        if (norm > 0.0) for (i in chroma.indices) chroma[i] /= norm
+        return chroma
     }
 
     private fun handleDelete(ids: List<Int>, paths: List<String>, result: MethodChannel.Result) {

@@ -6,12 +6,15 @@ class DuplicateGroup {
   final List<SongFile> songs; // 按音质从高到低排序
   final String displayTitle;
   final String reason; // 判定原因
+  /// 不同版本组：不建议自动勾选删除（用户手动决定）
+  final bool noAutoSelect;
 
   DuplicateGroup({
     required this.key,
     required this.songs,
     required this.displayTitle,
     required this.reason,
+    this.noAutoSelect = false,
   });
 
   Map<String, dynamic> toJson() => {
@@ -19,6 +22,7 @@ class DuplicateGroup {
         'songs': songs.map((s) => s.toJson()).toList(),
         'displayTitle': displayTitle,
         'reason': reason,
+        'noAutoSelect': noAutoSelect,
       };
 
   factory DuplicateGroup.fromJson(Map<String, dynamic> j) => DuplicateGroup(
@@ -28,6 +32,7 @@ class DuplicateGroup {
             .toList(),
         displayTitle: j['displayTitle'] as String,
         reason: j['reason'] as String,
+        noAutoSelect: (j['noAutoSelect'] as bool?) ?? false,
       );
 
   /// 音质最差的1个（自动勾选候选）
