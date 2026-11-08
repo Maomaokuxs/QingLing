@@ -40,28 +40,19 @@ class FingerprintCache {
     return c;
   }
 
-  /// 命中返回指纹；文件被修改/删除/无记录时返回 null
-  String? lookup(String path) {
+  /// 命中返回指纹；mtime 对不上/无记录时返回 null。
+  /// mtime 由调用方从 MediaStore DATE_MODIFIED 传入（秒），
+  /// 不再 FileStat 走直接路径（scoped storage 下可能无权限导致缓存永不命中）。
+  String? lookup(String path, int mtime) {
     final e = _entries[path];
     if (e == null || e.fp.isEmpty) return null;
-    try {
-      final mtime = FileStat.statSync(path).modified.millisecondsSinceEpoch;
-      if (mtime == e.mtime) return e.fp;
-    } catch (_) {
-      // 文件不可访问
-    }
-    return null;
+    return mtime == e.mtime ? e.fp : null;
   }
 
-  void store(String path, String fp) {
+  void store(String path, int mtime, String fp) {
     if (fp.isEmpty) return;
-    try {
-      final mtime = FileStat.statSync(path).modified.millisecondsSinceEpoch;
-      _entries[path] = _Entry(mtime, fp);
-      _dirty = true;
-    } catch (_) {
-      // ignore
-    }
+    _entries[path] = _Entry(mtime, fp);
+    _dirty = true;
   }
 
   Future<void> save() async {

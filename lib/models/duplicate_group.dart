@@ -14,6 +14,22 @@ class DuplicateGroup {
     required this.reason,
   });
 
+  Map<String, dynamic> toJson() => {
+        'key': key,
+        'songs': songs.map((s) => s.toJson()).toList(),
+        'displayTitle': displayTitle,
+        'reason': reason,
+      };
+
+  factory DuplicateGroup.fromJson(Map<String, dynamic> j) => DuplicateGroup(
+        key: j['key'] as String,
+        songs: (j['songs'] as List)
+            .map((e) => SongFile.fromJson(Map<String, dynamic>.from(e as Map)))
+            .toList(),
+        displayTitle: j['displayTitle'] as String,
+        reason: j['reason'] as String,
+      );
+
   /// 音质最差的1个（自动勾选候选）
   SongFile get worst => songs.last;
 

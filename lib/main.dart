@@ -1,13 +1,32 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'screens/home_screen.dart';
+import 'services/ignore_service.dart';
+import 'services/trash_service.dart';
 
 /// 全局主题模式：system 自动跟随系统，light/dark 手动切换
 final ValueNotifier<ThemeMode> themeModeNotifier = ValueNotifier(ThemeMode.system);
 /// 声纹开关（设置页可自由开启）
 final ValueNotifier<bool> fingerprintEnabledNotifier = ValueNotifier(true);
-/// 扫描目录：空表示全部，否则仅包含前缀匹配的路径
+/// 扫描范围：true=扫描全部目录（默认）；false=仅扫描 scanDirs 中的目录（前缀匹配）。
+/// 清单语义：勾上就是扫，不勾就是不扫。
+final ValueNotifier<bool> scanAllDirsNotifier = ValueNotifier(true);
 final ValueNotifier<List<String>> scanDirsNotifier = ValueNotifier([]);
+/// 每组保留的音质最佳版本数（1~3）
+final ValueNotifier<int> keepBestNotifier = ValueNotifier(1);
+/// 保留规则：quality=音质优先，lossless=优先无损，dir=优先指定目录
+final ValueNotifier<String> keepRuleNotifier = ValueNotifier('quality');
+/// 优先保留的目录（keepRule=dir 时生效）
+final ValueNotifier<String> keepDirNotifier = ValueNotifier('');
+/// 自动扫描：启动时若距离上次扫描超过 N 天则自动扫描
+final ValueNotifier<bool> autoScanNotifier = ValueNotifier(false);
+final ValueNotifier<int> autoScanDaysNotifier = ValueNotifier(7);
+/// 音频指纹开关：识别标题完全不同的同音频副本，解码开销大，默认开启
+final ValueNotifier<bool> acousticFpEnabledNotifier = ValueNotifier(true);
+/// 扫描后批量检测假无损：后台逐个解码无损文件，结果页打徽章
+final ValueNotifier<bool> batchSpectrumNotifier = ValueNotifier(true);
+/// 回收站自动清理：超过 N 天的记录自动删除，0=永不
+final ValueNotifier<int> trashRetentionDaysNotifier = ValueNotifier(30);
 
 Future<void> _loadSettings() async {
   final prefs = await SharedPreferences.getInstance();
@@ -21,8 +40,44 @@ Future<void> _loadSettings() async {
       _ => ThemeMode.system,
     };
   }
-  final dirs = prefs.getStringList('scan_dirs');
-  if (dirs != null) scanDirsNotifier.value = dirs;
+  // 新 key 优先；没有则从老版本 key 迁移
+  if (prefs.containsKey('scan_all_dirs')) {
+    scanAllDirsNotifier.value = prefs.getBool('scan_all_dirs') ?? true;
+    scanDirsNotifier.value = prefs.getStringList('scan_dirs') ?? [];
+  } else if (prefs.containsKey('scan_scope_mode')) {
+    // 三段式版本的迁移：exclude 无法表示，回退为全部（超集，最安全）
+    final m = prefs.getString('scan_scope_mode');
+    if (m == 'include') {
+      scanAllDirsNotifier.value = false;
+      scanDirsNotifier.value = prefs.getStringList('scan_scope_dirs') ?? [];
+    } else {
+      scanAllDirsNotifier.value = true;
+    }
+    await prefs.remove('scan_scope_mode');
+    await prefs.remove('scan_scope_dirs');
+  } else {
+    final oldDirs = prefs.getStringList('scan_dirs') ?? [];
+    if (oldDirs.isNotEmpty) {
+      scanAllDirsNotifier.value = false;
+      scanDirsNotifier.value = oldDirs;
+    }
+    await prefs.remove('scan_dirs');
+    await prefs.remove('excluded_dirs');
+  }
+  final kb = prefs.getInt('keep_best');
+  if (kb != null && kb >= 1 && kb <= 3) keepBestNotifier.value = kb;
+  final kr = prefs.getString('keep_rule');
+  if (kr == 'lossless' || kr == 'dir') keepRuleNotifier.value = kr!;
+  keepDirNotifier.value = prefs.getString('keep_dir') ?? '';
+  autoScanNotifier.value = prefs.getBool('auto_scan') ?? false;
+  final asd = prefs.getInt('auto_scan_days');
+  if (asd == 7 || asd == 14 || asd == 30) autoScanDaysNotifier.value = asd!;
+  final afp = prefs.getBool('acoustic_fp_enabled');
+  if (afp != null) acousticFpEnabledNotifier.value = afp;
+  final bs = prefs.getBool('batch_spectrum');
+  if (bs != null) batchSpectrumNotifier.value = bs;
+  final tr = prefs.getInt('trash_retention_days');
+  if (tr != null && tr >= 0) trashRetentionDaysNotifier.value = tr;
   fingerprintEnabledNotifier.addListener(() {
     SharedPreferences.getInstance().then((p) => p.setBool('fingerprint_enabled', fingerprintEnabledNotifier.value));
   });
@@ -34,14 +89,49 @@ Future<void> _loadSettings() async {
     };
     SharedPreferences.getInstance().then((p) => p.setString('theme_mode', v));
   });
+  scanAllDirsNotifier.addListener(() {
+    SharedPreferences.getInstance().then((p) => p.setBool('scan_all_dirs', scanAllDirsNotifier.value));
+  });
   scanDirsNotifier.addListener(() {
     SharedPreferences.getInstance().then((p) => p.setStringList('scan_dirs', scanDirsNotifier.value));
+  });
+  keepBestNotifier.addListener(() {
+    SharedPreferences.getInstance().then((p) => p.setInt('keep_best', keepBestNotifier.value));
+  });
+  keepRuleNotifier.addListener(() {
+    SharedPreferences.getInstance().then((p) => p.setString('keep_rule', keepRuleNotifier.value));
+  });
+  keepDirNotifier.addListener(() {
+    SharedPreferences.getInstance().then((p) => p.setString('keep_dir', keepDirNotifier.value));
+  });
+  autoScanNotifier.addListener(() {
+    SharedPreferences.getInstance().then((p) => p.setBool('auto_scan', autoScanNotifier.value));
+  });
+  autoScanDaysNotifier.addListener(() {
+    SharedPreferences.getInstance().then((p) => p.setInt('auto_scan_days', autoScanDaysNotifier.value));
+  });
+  acousticFpEnabledNotifier.addListener(() {
+    SharedPreferences.getInstance().then((p) => p.setBool('acoustic_fp_enabled', acousticFpEnabledNotifier.value));
+  });
+  batchSpectrumNotifier.addListener(() {
+    SharedPreferences.getInstance().then((p) => p.setBool('batch_spectrum', batchSpectrumNotifier.value));
+  });
+  trashRetentionDaysNotifier.addListener(() {
+    SharedPreferences.getInstance().then((p) => p.setInt('trash_retention_days', trashRetentionDaysNotifier.value));
   });
 }
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await _loadSettings();
+  await IgnoreService.load();
+  // 回收站过期自动清理（不阻塞启动）
+  final retentionDays = trashRetentionDaysNotifier.value;
+  if (retentionDays > 0) {
+    TrashService.purgeExpired(Duration(days: retentionDays)).then((n) {
+      if (n > 0) debugPrint('[song_dedup] trash auto-purged $n records');
+    });
+  }
   runApp(const SongDedupApp());
 }
 

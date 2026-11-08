@@ -62,7 +62,10 @@ void main() {
   });
 
   group('Tier2 时长锚定（跨格式）', () {
-    test('标题略异+同时长+不同格式 → 跨格式组', () async {
+    test('一字之差的不同音频+同时长 → 不误判（回归）', () async {
+      // testsongA(440Hz)/testsongB(880Hz) 是不同音频，仅一字之差。
+      // 旧逻辑标题相似度阈值 0.6（两者 0.875）会误判为跨格式重复；
+      // 收紧到归一化标题 ≥0.9 后，Tier2 与 Tier3 都不应收录。
       final songs = [
         mk(path: '/a/testsongA.wav', title: 'testsongA', durationMs: 35000, ext: 'wav', sizeBytes: 560000),
         mk(path: '/a/testsongB.mp3', title: 'testsongB', durationMs: 35000, ext: 'mp3', sizeBytes: 800000),
@@ -71,8 +74,35 @@ void main() {
         songs,
         enableFingerprint: false,
       );
+      expect(gs, isEmpty);
+    });
+
+    test('同歌+歌手元数据笔误+不同格式 → 跨格式组', () async {
+      // 同一首歌转格式时歌手写错一字：归一化 key 不等，
+      // 但归一化标题全等（1.0 ≥ 0.9），应被 Tier2 抓住
+      final songs = [
+        mk(path: '/a/夜曲.flac', title: '夜曲', artist: '周杰伦', durationMs: 210000, ext: 'flac', sizeBytes: 30000000),
+        mk(path: '/a/夜曲.mp3', title: '夜曲', artist: '周杰轮', durationMs: 210500, ext: 'mp3', sizeBytes: 8000000),
+      ];
+      final gs = await SimilarityService.groupSimilarSongsWithFingerprint(
+        songs,
+        enableFingerprint: false,
+      );
       expect(gs.length, 1);
       expect(gs.first.reason, '跨格式/转码重复');
+    });
+
+    test('标题带括号版本标注+同时长 → 跨格式组', () async {
+      // "夜曲 (Remastered)" 归一化后与 "夜曲" 全等
+      final songs = [
+        mk(path: '/a/夜曲.wav', title: '夜曲', durationMs: 180000, ext: 'wav'),
+        mk(path: '/a/夜曲重制.flac', title: '夜曲 (Remastered)', durationMs: 180500, ext: 'flac'),
+      ];
+      final gs = await SimilarityService.groupSimilarSongsWithFingerprint(
+        songs,
+        enableFingerprint: false,
+      );
+      expect(gs.length, 1);
     });
 
     test('标题完全不同+同时长 → 不误判', () async {

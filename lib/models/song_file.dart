@@ -12,6 +12,10 @@ class SongFile {
   final int durationMs;
   final int sizeBytes;
   final String extension; // mp3, flac...
+  /// MediaStore DATE_MODIFIED（秒）。缓存有效性校验用：
+  /// 直接 FileStat 走文件路径在 scoped storage 下可能无权限，
+  /// 用 MediaStore 列代替。0 表示未知。
+  final int dateModified;
   /// MediaStore 读到的真实码率（kbps），取不到时为 0
   final int realBitrateKbps;
 
@@ -38,6 +42,7 @@ class SongFile {
     required this.sizeBytes,
     required this.extension,
     this.realBitrateKbps = 0,
+    this.dateModified = 0,
     String? fingerprint,
   }) {
     bitrateKbps =
@@ -47,6 +52,37 @@ class SongFile {
     qualityLabel = qs.label;
     if (fingerprint != null) this.fingerprint = fingerprint;
   }
+
+  /// isolate 传输用：Dart isolate 消息不支持自定义对象，先转 Map
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'path': path,
+        'displayName': displayName,
+        'title': title,
+        'artist': artist,
+        'album': album,
+        'durationMs': durationMs,
+        'sizeBytes': sizeBytes,
+        'extension': extension,
+        'realBitrateKbps': realBitrateKbps,
+        'dateModified': dateModified,
+        'fingerprint': fingerprint,
+      };
+
+  factory SongFile.fromJson(Map<String, dynamic> j) => SongFile(
+        id: j['id'] as int,
+        path: j['path'] as String,
+        displayName: j['displayName'] as String,
+        title: j['title'] as String,
+        artist: j['artist'] as String,
+        album: j['album'] as String,
+        durationMs: j['durationMs'] as int,
+        sizeBytes: j['sizeBytes'] as int,
+        extension: j['extension'] as String,
+        realBitrateKbps: j['realBitrateKbps'] as int? ?? 0,
+        dateModified: j['dateModified'] as int? ?? 0,
+        fingerprint: j['fingerprint'] as String?,
+      );
 
   int _estimateBitrate() {
     if (durationMs <= 0 || sizeBytes <= 0) return 0;

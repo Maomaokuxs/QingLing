@@ -17,4 +17,36 @@ class QualityService {
     if (sortedDesc.length <= keepBest) return {};
     return sortedDesc.sublist(keepBest).map((e) => e.path).toSet();
   }
+
+  static const _losslessExts = {'flac', 'wav', 'aiff', 'aif', 'alac', 'ape'};
+
+  /// 按保留规则排序（从高到低）：quality=音质分，lossless=无损优先，
+  /// dir=指定目录优先（目录内再按音质）
+  static List<SongFile> sortByRuleDesc(
+      List<SongFile> list, String rule, String preferredDir) {
+    final copy = List<SongFile>.from(list);
+    bool isLossless(SongFile s) =>
+        _losslessExts.contains(s.extension.toLowerCase());
+    copy.sort((a, b) {
+      if (rule == 'lossless') {
+        final la = isLossless(a) ? 1 : 0;
+        final lb = isLossless(b) ? 1 : 0;
+        if (la != lb) return lb.compareTo(la);
+      } else if (rule == 'dir' && preferredDir.isNotEmpty) {
+        final da = a.path.startsWith(preferredDir) ? 1 : 0;
+        final db = b.path.startsWith(preferredDir) ? 1 : 0;
+        if (da != db) return db.compareTo(da);
+      }
+      return b.qualityScore.compareTo(a.qualityScore);
+    });
+    return copy;
+  }
+
+  /// 按规则自动选择待删除（保留每组最好的 keepBest 个）
+  static Set<String> autoSelectByRule(List<SongFile> songs,
+      {int keepBest = 1, String rule = 'quality', String preferredDir = ''}) {
+    final sorted = sortByRuleDesc(songs, rule, preferredDir);
+    if (sorted.length <= keepBest) return {};
+    return sorted.sublist(keepBest).map((e) => e.path).toSet();
+  }
 }

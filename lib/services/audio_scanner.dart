@@ -65,16 +65,13 @@ class AudioScanner {
           // MediaStore 的 bitrate 单位是 bps，转 kbps；取不到则为 0，
           // SongFile 会回退到按大小/时长估算
           realBitrateKbps: ((m['bitrate'] as int?) ?? 0) ~/ 1000,
+          dateModified: (m['dateModified'] as int?) ?? 0,
         ),
       );
     }
-    // 扫描目录过滤
+    // 扫描范围过滤：全部目录 或 仅扫描勾选的目录（前缀匹配）
+    if (scanAllDirsNotifier.value) return result;
     final dirs = scanDirsNotifier.value;
-    if (dirs.isNotEmpty) {
-      final filtered =
-          result.where((s) => dirs.any((d) => s.path.startsWith(d))).toList();
-      return filtered;
-    }
-    return result;
+    return result.where((s) => dirs.any((d) => s.path.startsWith(d))).toList();
   }
 }
