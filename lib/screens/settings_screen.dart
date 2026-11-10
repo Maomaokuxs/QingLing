@@ -1,19 +1,24 @@
+import '../models/duplicate_group.dart';
+import '../services/app_version.dart';
 import '../services/cache_service.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../main.dart';
 import 'about_screen.dart';
+import 'dir_stats_screen.dart';
+import 'export_lists_screen.dart';
 import 'lrc_dedup_screen.dart';
 import '../widgets/minimal_ui.dart';
 import '../services/ignore_service.dart';
 
 class SettingsScreen extends StatelessWidget {
-  /// 由主屏传入：在设置页内触发导出清单 / 目录统计（逻辑在主屏，原样保留）
-  final VoidCallback? onExportList;
-  final VoidCallback? onShowDirStats;
+  /// 目录统计 / 导出清单改为独立页面：主屏传当前分组，
+  /// 设置页直接 push 进去，返回回到设置页，不再 pop 回主页。
+  final List<DuplicateGroup>? dirGroups;
+  final int? totalBytes;
 
-  const SettingsScreen({super.key, this.onExportList, this.onShowDirStats});
+  const SettingsScreen({super.key, this.dirGroups, this.totalBytes});
 
   @override
   Widget build(BuildContext context) {
@@ -63,66 +68,81 @@ class SettingsScreen extends StatelessWidget {
                     ),
                   ),
                   _SectionHeader(title: '识别设置'),
-                  _MinimalCard(children: [
-                    _fingerprintRow(),
-                    _crossLingualRow(),
-                  ]),
+                  _MinimalCard(
+                    children: [
+                      _fingerprintRow(),
+                      _crossLingualRow(),
+                      _shortSongsRow(),
+                      _spectralRow(),
+                    ],
+                  ),
                   _SectionHeader(title: '回收站'),
-                  _MinimalCard(children: [
-                    _trashRetentionRow(),
-                  ]),
+                  _MinimalCard(children: [_trashRetentionRow()]),
                   _SectionHeader(title: '缓存'),
-                  _MinimalCard(children: [
-                    const _CacheTile(),
-                  ]),
+                  _MinimalCard(children: [const _CacheTile()]),
                   _SectionHeader(title: '工具'),
-                  _MinimalCard(children: [
-                    _Row(
-                      title: '导出清单',
-                      subtitle: '将重复清单导出为文本或播放列表并分享',
-                      onTap: onExportList == null
-                          ? null
-                          : () {
-                              Navigator.pop(context);
-                              onExportList!();
-                            },
-                    ),
-                    _Row(
-                      title: '目录统计',
-                      subtitle: '按目录查看重复文件的分布与占用空间',
-                      onTap: onShowDirStats == null
-                          ? null
-                          : () {
-                              Navigator.pop(context);
-                              onShowDirStats!();
-                            },
-                    ),
-                    _Row(
-                      title: '歌词去重',
-                      subtitle: '扫描并清理重复的歌词文件',
-                      onTap: () => Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                            builder: (_) => const LrcDedupScreen()),
+                  _MinimalCard(
+                    children: [
+                      _Row(
+                        title: '导出清单',
+                        subtitle: '导出当前重复清单并分享，历史清单记录也在里面，可从回收站恢复',
+                        onTap: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => ExportListsScreen(
+                              groups: dirGroups ?? const [],
+                            ),
+                          ),
+                        ),
                       ),
-                    ),
-                  ]),
+                      _Row(
+                        title: '目录统计',
+                        subtitle: '按目录查看重复文件的分布与占用空间',
+                        onTap: dirGroups == null
+                            ? null
+                            : () => Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) =>
+                                      DirStatsScreen(
+                                        groups: dirGroups!,
+                                        totalBytes: totalBytes,
+                                      ),
+                                ),
+                              ),
+                      ),
+                      _Row(
+                        title: '歌词去重',
+                        subtitle: '扫描并清理重复的歌词文件',
+                        onTap: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => const LrcDedupScreen(),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
                   _SectionHeader(title: '外观'),
-                  _MinimalCard(children: [
-                    _themeModeRow(),
-                  ]),
+                  _MinimalCard(children: [_themeModeRow()]),
                   _SectionHeader(title: '关于'),
-                  _MinimalCard(children: [
-                    _Row(
-                      title: '关于',
-                      subtitle: '版本 0.2.0 · 检查更新 · 开源许可',
-                      onTap: () => Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                            builder: (_) => const AboutScreen()),
+                  _MinimalCard(
+                    children: [
+                      FutureBuilder<String>(
+                        future: AppVersion.get(),
+                        builder: (context, snap) => _Row(
+                          title: '关于',
+                          subtitle: '版本 ${snap.data ?? '…'} · 检查更新 · 开源许可',
+                          onTap: () => Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => const AboutScreen(),
+                            ),
+                          ),
+                        ),
                       ),
-                    ),
-                  ]),
+                    ],
+                  ),
                 ],
               ),
             ),
@@ -180,10 +200,8 @@ class SettingsScreen extends StatelessWidget {
           subtitle: rule == 'quality'
               ? '按音质分保留最好的版本'
               : rule == 'lossless'
-                  ? '优先保留无损格式（FLAC/WAV），再按音质'
-                  : (dir.isEmpty
-                      ? '优先保留指定目录（未设置目录）'
-                      : '优先保留目录：$dir'),
+              ? '优先保留无损格式（FLAC/WAV），再按音质'
+              : (dir.isEmpty ? '优先保留指定目录（未设置目录）' : '优先保留目录：$dir'),
           trailing: _M3Dropdown<String>(
             value: rule,
             options: const {
@@ -279,10 +297,47 @@ class SettingsScreen extends StatelessWidget {
       valueListenable: crossLingualEnabledNotifier,
       builder: (context, enabled, _) => _Row(
         title: '组内版本细分',
-        subtitle: enabled ? '已开启：同名组内用声学指纹区分不同版本/语言，不自动勾选，扫描明显变慢' : '已关闭：跳过组内声学比对，扫描更快',
+        subtitle: enabled
+            ? '已开启：同名组内用声学指纹区分不同版本/语言，不自动勾选，扫描明显变慢'
+            : '已关闭：跳过组内声学比对，扫描更快',
         trailing: MinimalSwitch(
           value: enabled,
           onChanged: (v) => crossLingualEnabledNotifier.value = v,
+        ),
+      ),
+    );
+  }
+
+  /// 扫描短音频开关：短于 30 秒的音频（游戏 BGM、片段等）是否进扫描
+  Widget _shortSongsRow() {
+    return ValueListenableBuilder<bool>(
+      valueListenable: includeShortSongsNotifier,
+      builder: (context, enabled, _) => _Row(
+        title: '扫描 30 秒以下短音频',
+        subtitle: enabled
+            ? '已开启：30 秒以下的短音频也进扫描（如游戏 BGM、片段）'
+            : '已关闭：短于 30 秒的音频不扫描',
+        trailing: MinimalSwitch(
+          value: enabled,
+          onChanged: (v) => includeShortSongsNotifier.value = v,
+        ),
+      ),
+    );
+  }
+
+  /// 假无损检测开关：默认关闭。打开后对组内无损文件做频谱分析，
+  /// 截止明显低于奈奎斯特的判疑似假无损，扫描变慢（首扫组内文件多算）。
+  Widget _spectralRow() {
+    return ValueListenableBuilder<bool>(
+      valueListenable: spectralEnabledNotifier,
+      builder: (context, enabled, _) => _Row(
+        title: '假无损检测',
+        subtitle: enabled
+            ? '已开启：组内无损文件做频谱分析，疑似假无损降级、不优先保留，扫描变慢'
+            : '已关闭：跳过频谱分析，无损文件按标称音质排序',
+        trailing: MinimalSwitch(
+          value: enabled,
+          onChanged: (v) => spectralEnabledNotifier.value = v,
         ),
       ),
     );
@@ -332,12 +387,7 @@ class _Row extends StatelessWidget {
   final Widget? trailing;
   final VoidCallback? onTap;
 
-  const _Row({
-    required this.title,
-    this.subtitle,
-    this.trailing,
-    this.onTap,
-  });
+  const _Row({required this.title, this.subtitle, this.trailing, this.onTap});
 
   @override
   Widget build(BuildContext context) {
@@ -356,15 +406,18 @@ class _Row extends StatelessWidget {
                   Text(
                     title,
                     style: const TextStyle(
-                        fontSize: 13, fontWeight: FontWeight.w600),
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                   if (subtitle != null) ...[
                     const SizedBox(height: 2),
                     Text(
                       subtitle!,
                       style: TextStyle(
-                          fontSize: 10.5,
-                          color: scheme.onSurfaceVariant),
+                        fontSize: 10.5,
+                        color: scheme.onSurfaceVariant,
+                      ),
                     ),
                   ],
                 ],
@@ -374,8 +427,11 @@ class _Row extends StatelessWidget {
               const SizedBox(width: 10),
               trailing!,
             ] else if (onTap != null)
-              Icon(Icons.chevron_right_rounded,
-                  color: scheme.outline, size: 18),
+              Icon(
+                Icons.chevron_right_rounded,
+                color: scheme.outline,
+                size: 18,
+              ),
           ],
         ),
       ),
@@ -403,8 +459,7 @@ class _MinimalTextAction extends StatelessWidget {
       child: Opacity(
         opacity: enabled ? 1 : 0.4,
         child: Container(
-          padding:
-              const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
           decoration: BoxDecoration(
             color: secondaryFillColor(context),
             borderRadius: BorderRadius.circular(8),
@@ -412,9 +467,10 @@ class _MinimalTextAction extends StatelessWidget {
           child: Text(
             label,
             style: TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-                color: scheme.onSurfaceVariant),
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+              color: scheme.onSurfaceVariant,
+            ),
           ),
         ),
       ),
@@ -434,13 +490,15 @@ class _MinimalCard extends StatelessWidget {
     final divided = <Widget>[];
     for (var i = 0; i < children.length; i++) {
       if (i > 0) {
-        divided.add(Divider(
-          height: 1,
-          thickness: 1,
-          indent: 14,
-          endIndent: 14,
-          color: scheme.outlineVariant.withValues(alpha: 0.5),
-        ));
+        divided.add(
+          Divider(
+            height: 1,
+            thickness: 1,
+            indent: 14,
+            endIndent: 14,
+            color: scheme.outlineVariant.withValues(alpha: 0.5),
+          ),
+        );
       }
       divided.add(children[i]);
     }
@@ -451,10 +509,7 @@ class _MinimalCard extends StatelessWidget {
         border: Border.all(color: scheme.outlineVariant, width: 1),
         borderRadius: BorderRadius.circular(16),
       ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: divided,
-      ),
+      child: Column(mainAxisSize: MainAxisSize.min, children: divided),
     );
   }
 }
@@ -505,8 +560,10 @@ class _M3Dropdown<T> extends StatelessWidget {
     final position = RelativeRect.fromRect(
       Rect.fromPoints(
         button.localToGlobal(Offset.zero, ancestor: overlay),
-        button.localToGlobal(button.size.bottomRight(Offset.zero),
-            ancestor: overlay),
+        button.localToGlobal(
+          button.size.bottomRight(Offset.zero),
+          ancestor: overlay,
+        ),
       ),
       Offset.zero & overlay.size,
     );
@@ -522,12 +579,10 @@ class _M3Dropdown<T> extends StatelessWidget {
       ),
       items: [
         for (var i = 0; i < entries.length; i++) ...[
-          if (i > 0)
-            const PopupMenuDivider(height: 1),
+          if (i > 0) const PopupMenuDivider(height: 1),
           PopupMenuItem<T>(
             value: entries[i].key,
-            padding:
-                const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -545,8 +600,7 @@ class _M3Dropdown<T> extends StatelessWidget {
                 ),
                 if (entries[i].key == value) ...[
                   const SizedBox(width: 8),
-                  Icon(Icons.check_rounded,
-                      size: 14, color: scheme.onSurface),
+                  Icon(Icons.check_rounded, size: 14, color: scheme.onSurface),
                 ],
               ],
             ),
@@ -564,8 +618,7 @@ class _M3Dropdown<T> extends StatelessWidget {
       onTap: () => _showMenu(context),
       borderRadius: BorderRadius.circular(12),
       child: Container(
-        padding:
-            const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         decoration: BoxDecoration(
           border: Border.all(color: scheme.outlineVariant, width: 1),
           borderRadius: BorderRadius.circular(12),
@@ -582,8 +635,11 @@ class _M3Dropdown<T> extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 2),
-            Icon(Icons.arrow_drop_down_rounded,
-                size: 18, color: scheme.onSurfaceVariant),
+            Icon(
+              Icons.arrow_drop_down_rounded,
+              size: 18,
+              color: scheme.onSurfaceVariant,
+            ),
           ],
         ),
       ),
@@ -625,16 +681,19 @@ class _CacheTileState extends State<_CacheTile> {
       builder: (c) => AlertDialog(
         title: const Text('清除扫描缓存？'),
         content: const Text(
-            '将删除文件指纹、声学指纹、封面/歌词三项缓存。'
-            '下次扫描会重新计算、慢一些，但扫描结果不受影响。'
-            '回收站和各项设置不会被清除。'),
+          '将删除扫描结果、文件指纹、声学指纹、封面/歌词四项缓存。'
+          '下次扫描会重新计算、慢一些，但扫描结果不受影响。'
+          '回收站和各项设置不会被清除。',
+        ),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(c, false),
-              child: const Text('取消')),
+            onPressed: () => Navigator.pop(c, false),
+            child: const Text('取消'),
+          ),
           FilledButton(
-              onPressed: () => Navigator.pop(c, true),
-              child: const Text('清除')),
+            onPressed: () => Navigator.pop(c, true),
+            child: const Text('清除'),
+          ),
         ],
       ),
     );
@@ -642,9 +701,9 @@ class _CacheTileState extends State<_CacheTile> {
     final freed = await CacheService.clearAll();
     await _reload();
     if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('已清除扫描缓存，释放 ${_fmt(freed)}')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('已清除扫描缓存，释放 ${_fmt(freed)}')));
     }
   }
 
@@ -653,9 +712,7 @@ class _CacheTileState extends State<_CacheTile> {
     final b = _bytes;
     return _Row(
       title: '清除扫描缓存',
-      subtitle: b == null
-          ? '正在统计…'
-          : '当前缓存 ${_fmt(b)}，清除后下次扫描变慢，结果不受影响',
+      subtitle: b == null ? '正在统计…' : '当前缓存 ${_fmt(b)}，清除后下次扫描变慢，结果不受影响',
       trailing: _MinimalTextAction(
         label: '清除',
         enabled: b != null && b > 0,
@@ -686,9 +743,9 @@ Future<void> _confirmClearIgnored(BuildContext context) async {
   if (ok == true) {
     await IgnoreService.clear();
     if (context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('已清空，请重新扫描')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('已清空，请重新扫描')));
     }
   }
 }
@@ -762,16 +819,14 @@ Future<void> _showScanDirDialog(BuildContext context) async {
                   onPressed: scanAll
                       ? null
                       : () async {
-                          final dir =
-                              await FilePicker.platform.getDirectoryPath();
+                          final dir = await FilePicker.platform
+                              .getDirectoryPath();
                           if (dir != null && dir.isNotEmpty) {
                             setState(() => selected.add(dir));
                           }
                         },
-                  icon:
-                      const Icon(Icons.create_new_folder_outlined, size: 18),
-                  label:
-                      const Text('添加目录…', style: TextStyle(fontSize: 13)),
+                  icon: const Icon(Icons.create_new_folder_outlined, size: 18),
+                  label: const Text('添加目录…', style: TextStyle(fontSize: 13)),
                 ),
               ),
             ],

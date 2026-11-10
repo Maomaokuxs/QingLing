@@ -7,7 +7,10 @@ import 'dart:math';
 import 'package:crypto/crypto.dart';
 
 /// 计算单个文件的内容指纹（worker isolate 内执行，必须是顶层函数）
-String _hashFile(String path, int sizeBytes, int durationMs, String ext) {
+/// 只用文件内容（前 32KB）+ 文件大小 + 扩展名。
+/// 注意：不要混入 durationMs——MediaStore 读的时长同一文件可能差几毫秒，
+/// 混入后同一音频文件的哈希会不同，Tier 4 抓不到字节相同的文件。
+String _hashFile(String path, int sizeBytes, String ext) {
   try {
     final f = File(path);
     if (!f.existsSync()) return '';
@@ -17,7 +20,7 @@ String _hashFile(String path, int sizeBytes, int durationMs, String ext) {
       final bytes = raf.readSync(len);
       final digest = sha256.convert([
         ...bytes,
-        ...utf8.encode('$sizeBytes|$durationMs|$ext'),
+        ...utf8.encode('$sizeBytes|$ext'),
       ]);
       return digest.toString().substring(0, 16);
     } finally {
@@ -43,8 +46,7 @@ void _workerEntry(List<SendPort> ports) {
     final fp = _hashFile(
       m[1] as String,
       m[2] as int,
-      m[3] as int,
-      m[4] as String,
+      m[3] as String,
     );
     resultPort.send([m[0], fp]);
   });
@@ -101,18 +103,17 @@ class HashWorkerPool {
   Future<String> hashFile(
     String path,
     int sizeBytes,
-    int durationMs,
     String ext,
   ) {
     if (!_started || _workers.isEmpty) {
-      return Future.value(_hashFile(path, sizeBytes, durationMs, ext));
+      return Future.value(_hashFile(path, sizeBytes, ext));
     }
     final id = _nextId++;
     final c = Completer<String>();
     _pending[id] = c;
     final w = _workers[_cursor % _workers.length];
     _cursor++;
-    w.send([id, path, sizeBytes, durationMs, ext]);
+    w.send([id, path, sizeBytes, ext]);
     return c.future;
   }
 

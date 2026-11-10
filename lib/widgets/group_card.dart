@@ -217,13 +217,21 @@ class _GroupCardState extends State<GroupCard> {
                     children: [
                       // 音质：纯文字颜色，不做徽章
                       Text(
-                        s.qualityLabel,
+                        s.effectiveQualityLabel,
                         style: TextStyle(
                           fontSize: 11,
                           fontWeight: FontWeight.w700,
-                          color: qualityTextColor(context, s.qualityLabel),
+                          color: qualityTextColor(
+                              context, s.effectiveQualityLabel),
                         ),
                       ),
+                      if (s.isFakeLossless)
+                        Padding(
+                          padding: const EdgeInsets.only(left: 6),
+                          child: _TagBadge(
+                              icon: Icons.warning_amber_rounded,
+                              label: '疑似假无损'),
+                        ),
                       if (widget.hasCover[s.path] == true)
                         Padding(
                           padding: const EdgeInsets.only(left: 6),

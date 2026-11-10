@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider 共享路径：更新下载的 APK 放应用缓存目录 -->
+<paths>
+    <cache-path name="update" path="." />
+    <external-cache-path name="update_external" path="." />
+</paths>

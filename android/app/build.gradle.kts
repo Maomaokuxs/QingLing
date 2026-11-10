@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "com.example.song_dedup"
+    namespace = "com.qingling.app"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -15,7 +15,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.example.song_dedup"
+        applicationId = "com.qingling.app"
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode

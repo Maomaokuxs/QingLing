@@ -5,11 +5,13 @@
 import '../models/song_file.dart';
 
 class QualityService {
-  /// 音质比较（从高到低）：分数 -> 真实码率 -> 文件大小。
+  /// 音质比较（从高到低）：有效分 -> 真实码率 -> 文件大小。
+  /// 有效分 = 标称分，假无损按估算真实码率降级后的分（见
+  /// SongFile.effectiveQualityScore），假 FLAC 不再靠标称高分排第一。
   /// 分数打平（比如两个高码率 FLAC 都是 800 分）时，用码率/大小
   /// 决定先后，避免任意排序导致码率高的反而被勾选删除。
   static int compareQualityDesc(SongFile a, SongFile b) {
-    final qc = b.qualityScore.compareTo(a.qualityScore);
+    final qc = b.effectiveQualityScore.compareTo(a.effectiveQualityScore);
     if (qc != 0) return qc;
     final bc = b.bitrateKbps.compareTo(a.bitrateKbps);
     if (bc != 0) return bc;

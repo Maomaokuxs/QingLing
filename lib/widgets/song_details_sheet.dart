@@ -84,7 +84,7 @@ class _SongDetailsSheetState extends State<_SongDetailsSheet> {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  '音质：${s.qualityLabel} · ${s.formattedBitrate}',
+                  '音质：${s.effectiveQualityLabel} · ${s.formattedBitrate}${s.isFakeLossless ? ' · 疑似假无损（频谱截止 ${(s.spectral!.cutoffHz / 1000).toStringAsFixed(1)}kHz，约 ${s.spectral!.estimatedTrueBitrateKbps}kbps 来源）' : ''}',
                   style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
                 ),
                 const Divider(height: 24),

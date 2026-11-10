@@ -11,8 +11,11 @@ import '../models/song_file.dart';
 import '../services/media_tags_service.dart';
 import '../services/audio_scanner.dart';
 import '../services/delete_service.dart';
+import '../services/export_list_service.dart';
 import '../services/ignore_service.dart';
 import '../services/quality_service.dart';
+import '../services/scan_cache.dart';
+import '../services/scan_history_service.dart';
 import '../services/share_service.dart';
 import '../services/similarity_service.dart';
 import '../services/trash_service.dart';
@@ -114,9 +117,9 @@ class _HomeScreenState extends State<HomeScreen> {
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).clearSnackBars();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('无法试听: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('无法试听: $e')));
     }
   }
 
@@ -127,9 +130,9 @@ class _HomeScreenState extends State<HomeScreen> {
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).clearSnackBars();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('无法试听: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('无法试听: $e')));
     }
   }
 
@@ -210,8 +213,10 @@ class _HomeScreenState extends State<HomeScreen> {
                     g.displayTitle,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style:
-                        TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: scheme.onSurfaceVariant,
+                    ),
                   ),
                   const SizedBox(height: 8),
                   Flexible(
@@ -244,10 +249,11 @@ class _HomeScreenState extends State<HomeScreen> {
                                   abChip('B', Colors.orange.shade800),
                               ],
                             ),
-                            selected: pickA?.path == s.path ||
-                                pickB?.path == s.path,
-                            selectedTileColor:
-                                scheme.primary.withValues(alpha: 0.08),
+                            selected:
+                                pickA?.path == s.path || pickB?.path == s.path,
+                            selectedTileColor: scheme.primary.withValues(
+                              alpha: 0.08,
+                            ),
                             onTap: () => assign(s),
                           ),
                       ],
@@ -264,8 +270,10 @@ class _HomeScreenState extends State<HomeScreen> {
                   const SizedBox(height: 6),
                   Text(
                     '点歌曲设为 A / B（再点取消），选好后点下方按钮来回试听，每次都从头播放',
-                    style:
-                        TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: scheme.onSurfaceVariant,
+                    ),
                   ),
                 ],
               ),
@@ -298,7 +306,9 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setInt(
-          'last_scan_time', DateTime.now().millisecondsSinceEpoch);
+        'last_scan_time',
+        DateTime.now().millisecondsSinceEpoch,
+      );
     } catch (_) {}
   }
 
@@ -314,7 +324,20 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  /// 扫描范围指纹：范围、短音频开关或假无损开关变化则缓存失效，走全量扫描。
+  String _scanScopeKey() {
+    final base = scanAllDirsNotifier.value
+        ? 'all'
+        : 'dirs:${(List<String>.from(scanDirsNotifier.value)..sort()).join(',')}';
+    var key = includeShortSongsNotifier.value ? '$base+short' : base;
+    if (spectralEnabledNotifier.value) key = '$key+spectral';
+    return key;
+  }
+
   Future<void> _scan() async {
+    final totalSw = Stopwatch()..start();
+    final stageMs = <String, int>{};
+    var newOrChanged = -1;
     setState(() {
       scanning = true;
       status = '正在扫描媒体库...';
@@ -324,56 +347,162 @@ class _HomeScreenState extends State<HomeScreen> {
       selections.clear();
     });
     try {
-      final all = await scanner.scanAll();
+      // 先读缓存：供原生跳过未变文件（只读新增/变更的元数据），
+      // 也供增量分组复用旧组。
+      final scopeKey = _scanScopeKey();
+      var sw = Stopwatch()..start();
+      final cache = await ScanCache.load(scopeKey);
+      stageMs['cacheLoadMs'] = sw.elapsedMilliseconds;
+      final cachedSongs = cache == null
+          ? null
+          : {for (final s in cache.allFiles) s.path: s};
+
+      sw = Stopwatch()..start();
+      // 媒体库扫描占大头：原生进度 0→60%，让进度条一直走、不停在 0。
+      // walk=遍历目录（约占媒体扫描九成时间）映射到 0-50%，
+      // meta=读元数据映射到 50-60%。
+      final all = await scanner.scanAll(
+        includeShort: includeShortSongsNotifier.value,
+        cachedSongs: cachedSongs,
+        onMediaProgress: (stage, fraction, processed, total) {
+          final overall = stage == 'walk'
+              ? 0.5 * fraction
+              : 0.5 + 0.1 * fraction;
+          final label = stage == 'walk' ? '正在查找文件' : '扫描媒体库';
+          _updateScanProgress(overall, label);
+        },
+      );
+      stageMs['mediaScanMs'] = sw.elapsedMilliseconds;
       allSongs = all;
       totalSongs = all.length;
       // Tier 1~3 在后台 isolate 跑，界面保持响应
-      _updateScanProgress(0, '标题时长分组');
+      _updateScanProgress(0.6, '标题时长分组');
 
-      final g = (await SimilarityService.groupSimilarSongsWithFingerprint(
-        all,
-        enableFingerprint: fingerprintEnabledNotifier.value,
-        enableCrossLingual: crossLingualEnabledNotifier.value,
-        onProgress: (done, total) {
-          _updateScanProgress(done / (total == 0 ? 1 : total), '文件指纹分析');
-        },
-        onChromaProgress: (done, total) {
-          _updateScanProgress(done / (total == 0 ? 1 : total), '声学细分');
-        },
-      ))
+      // 增量扫描：有缓存时只对新增/变更文件分组，旧组直接复用；
+      // 无缓存（首次 / 范围变化 / 手动清除）走全量扫描。
+      // 后续阶段占 60%→100%。
+      List<DuplicateGroup> allGroups;
+      if (cache == null) {
+        allGroups = await SimilarityService.groupSimilarSongsWithFingerprint(
+          all,
+          enableFingerprint: fingerprintEnabledNotifier.value,
+          enableCrossLingual: crossLingualEnabledNotifier.value,
+          enableSpectral: spectralEnabledNotifier.value,
+          onProgress: (done, total) {
+            _updateScanProgress(
+                0.6 + 0.4 * (done / (total == 0 ? 1 : total)), '文件指纹分析');
+          },
+          onChromaProgress: (done, total) {
+            _updateScanProgress(
+                0.6 + 0.4 * (done / (total == 0 ? 1 : total)), '声学细分');
+          },
+          onSpectralProgress: (done, total) {
+            _updateScanProgress(
+                0.6 + 0.4 * (done / (total == 0 ? 1 : total)), '频谱分析');
+          },
+          stageMs: stageMs,
+        );
+      } else {
+        final diff = ScanCache.splitNewVsOld(all, cache.allFiles);
+        newOrChanged = diff.changed.length;
+        final byPath = {for (final s in all) s.path: s};
+        final changedPaths = diff.changed.map((s) => s.path).toSet();
+        final oldGroups = ScanCache.refreshGroups(
+          cache.groups,
+          byPath,
+          changedPaths,
+        );
+        if (diff.changed.isEmpty) {
+          // 无新增/变更：旧组即最终结果，跳过分组计算
+          allGroups = oldGroups;
+        } else {
+          allGroups = await SimilarityService.groupIncremental(
+            newSongs: diff.changed,
+            oldSongs: diff.unchanged,
+            oldGroups: oldGroups,
+            enableFingerprint: fingerprintEnabledNotifier.value,
+            enableCrossLingual: crossLingualEnabledNotifier.value,
+            enableSpectral: spectralEnabledNotifier.value,
+            onProgress: (done, total) {
+              _updateScanProgress(
+                  0.6 + 0.4 * (done / (total == 0 ? 1 : total)), '文件指纹分析');
+            },
+            onChromaProgress: (done, total) {
+              _updateScanProgress(
+                  0.6 + 0.4 * (done / (total == 0 ? 1 : total)), '声学细分');
+            },
+            onSpectralProgress: (done, total) {
+              _updateScanProgress(
+                  0.6 + 0.4 * (done / (total == 0 ? 1 : total)), '频谱分析');
+            },
+            stageMs: stageMs,
+          );
+        }
+      }
+
+      final g = allGroups
           // 跳过用户标记"不是重复"的分组
           .where((grp) => !IgnoreService.isIgnored(grp.key))
           .toList();
       final keepN = keepBestNotifier.value;
+      sw = Stopwatch()..start();
       for (final grp in g) {
         // 同名不同版本组不自动勾选，用户手动决定
         selections[grp.key] = grp.noAutoSelect
             ? <String>{}
-            : QualityService.autoSelectByRule(grp.songs, keepBest: keepN,
+            : QualityService.autoSelectByRule(
+                grp.songs,
+                keepBest: keepN,
                 rule: keepRuleNotifier.value,
-                preferredDir: keepDirNotifier.value);
+                preferredDir: keepDirNotifier.value,
+              );
       }
+      stageMs['autoSelectMs'] = sw.elapsedMilliseconds;
+      // 保存扫描结果（过滤前，含被忽略的组——取消忽略后重扫能恢复）
+      sw = Stopwatch()..start();
+      await ScanCache.save(
+        groups: allGroups,
+        selections: selections,
+        scopeKey: scopeKey,
+        totalSongs: totalSongs,
+        allSongs: all,
+      );
+      stageMs['cacheSaveMs'] = sw.elapsedMilliseconds;
+      stageMs['totalMs'] = totalSw.elapsedMilliseconds;
+      // 写扫描历史文本报告（供调试核验，adb 可直接读取）
+      await ScanHistoryService.record(
+        groups: g,
+        selections: selections,
+        totalSongs: totalSongs,
+        scopeKey: scopeKey,
+        stageMs: stageMs,
+        newOrChanged: newOrChanged,
+        includeShort: includeShortSongsNotifier.value,
+        allSongs: allSongs,
+      );
       setState(() {
         groups = g;
-        status = g.isEmpty
-            ? '未发现重复（共 $totalSongs 首）'
-            : '发现 ${g.length} 组重复';
+        status = g.isEmpty ? '未发现重复（共 $totalSongs 首）' : '发现 ${g.length} 组重复';
       });
       // 扫描后后台批量检测封面/歌词
       _batchMediaTagsCheck();
-      debugPrint('[song_dedup] scan done: ${g.length} groups, total=$totalSongs');
+      debugPrint(
+        '[song_dedup] scan done: ${g.length} groups, total=$totalSongs',
+      );
       _recordScanTime();
       for (final grp in g.take(5)) {
-        debugPrint('[song_dedup] group reason=${grp.reason} '
-            'songs=${grp.songs.map((s) => '${s.displayName}@${s.bitrateKbps}kbps').toList()}');
+        debugPrint(
+          '[song_dedup] group reason=${grp.reason} '
+          'songs=${grp.songs.map((s) => '${s.displayName}@${s.bitrateKbps}kbps').toList()}',
+        );
       }
     } catch (e) {
       setState(() => status = '扫描失败: $e');
       if (mounted) {
         ScaffoldMessenger.of(context).clearSnackBars();
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('扫描失败: $e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('扫描失败: $e')));
       }
     } finally {
       if (mounted) setState(() => scanning = false);
@@ -400,8 +529,7 @@ class _HomeScreenState extends State<HomeScreen> {
         var r = cache.get(s.path, s.sizeBytes);
         r ??= await MediaTagsService.checkTags(s.id, s.path);
         if (r != null) {
-          await cache.put(s.path, s.sizeBytes, r['hasCover']!,
-              r['hasLyrics']!);
+          await cache.put(s.path, s.sizeBytes, r['hasCover']!, r['hasLyrics']!);
           if (mounted) {
             setState(() {
               hasCoverMap[s.path] = r!['hasCover']!;
@@ -414,125 +542,6 @@ class _HomeScreenState extends State<HomeScreen> {
     } finally {}
   }
 
-  /// 导出重复清单：文本格式
-  String _buildDuplicateListText() {
-    final buf = StringBuffer();
-    final now = DateTime.now();
-    String two(int v) => v.toString().padLeft(2, '0');
-    buf.writeln('清聆 重复清单');
-    buf.writeln(
-        '${now.year}-${two(now.month)}-${two(now.day)} ${two(now.hour)}:${two(now.minute)}');
-    buf.writeln('共 ${groups.length} 组重复');
-    buf.writeln('---');
-    for (final g in groups) {
-      buf.writeln('[${g.reason}] ${g.songs.length} 个版本');
-      for (final f in g.songs) {
-        buf.writeln('  ${f.displayName} | ${f.formattedBitrate} | ${f.formattedSize}');
-        buf.writeln('  ${f.path}');
-      }
-      buf.writeln('');
-    }
-    return buf.toString();
-  }
-
-  /// 导出重复清单：M3U 播放列表格式
-  String _buildDuplicateListM3u() {
-    final buf = StringBuffer();
-    buf.writeln('#EXTM3U');
-    for (final g in groups) {
-      for (final f in g.songs) {
-        final secs = (f.durationMs / 1000).round();
-        buf.writeln('#EXTINF:$secs,${f.artist} - ${f.title}');
-        buf.writeln(f.path);
-      }
-    }
-    return buf.toString();
-  }
-
-  /// 按目录统计重复分布：目录 -> 文件数/占用空间
-  Future<void> _showDirStats() async {
-    if (groups.isEmpty || !mounted) return;
-    final stats = <String, ({int count, int bytes})>{};
-    for (final g in groups) {
-      for (final f in g.songs) {
-        final i = f.path.lastIndexOf('/');
-        final dir = i > 0 ? f.path.substring(0, i) : '/';
-        final e = stats[dir];
-        stats[dir] = (
-          count: (e?.count ?? 0) + 1,
-          bytes: (e?.bytes ?? 0) + f.sizeBytes
-        );
-      }
-    }
-    final sorted = stats.entries.toList()
-      ..sort((a, b) => b.value.bytes.compareTo(a.value.bytes));
-    await showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      builder: (c) => DraggableScrollableSheet(
-        expand: false,
-        initialChildSize: 0.6,
-        minChildSize: 0.4,
-        maxChildSize: 0.9,
-        builder: (c2, scroll) => Column(
-          children: [
-            const Padding(
-              padding: EdgeInsets.fromLTRB(16, 12, 16, 4),
-              child: Text('目录重复分布',
-                  style:
-                      TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
-            ),
-            Expanded(
-              child: ListView.builder(
-                controller: scroll,
-                itemCount: sorted.length,
-                itemBuilder: (c3, i) {
-                  final e = sorted[i];
-                  return ListTile(
-                    dense: true,
-                    leading: const Icon(Icons.folder_rounded, size: 20),
-                    title: Text(e.key,
-                        style: const TextStyle(fontSize: 13),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis),
-                    subtitle: Text(
-                        '${e.value.count} 个重复文件 · 占用 ${_fmt(e.value.bytes)}',
-                        style: const TextStyle(fontSize: 11)),
-                  );
-                },
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Future<void> _exportDuplicateList() async {
-    if (groups.isEmpty || !mounted) return;
-    final fmt = await showDialog<String>(
-      context: context,
-      builder: (c) => SimpleDialog(
-        title: const Text('导出重复清单'),
-        children: [
-          SimpleDialogOption(
-            onPressed: () => Navigator.pop(c, 'text'),
-            child: const Text('文本格式（.txt）'),
-          ),
-          SimpleDialogOption(
-            onPressed: () => Navigator.pop(c, 'm3u'),
-            child: const Text('播放列表（.m3u）'),
-          ),
-        ],
-      ),
-    );
-    if (fmt == null || !mounted) return;
-    final content =
-        fmt == 'm3u' ? _buildDuplicateListM3u() : _buildDuplicateListText();
-    await ShareService.shareText(content,
-        title: fmt == 'm3u' ? '分享重复清单（M3U）' : '分享重复清单');
-  }
-
   /// 清理报告文本：删除清单 + 释放空间，供系统分享。
   String _buildDeleteReport(List<TrashRecord> records) {
     final buf = StringBuffer();
@@ -540,7 +549,8 @@ class _HomeScreenState extends State<HomeScreen> {
     String two(int v) => v.toString().padLeft(2, '0');
     buf.writeln('清聆 清理报告');
     buf.writeln(
-        '${now.year}-${two(now.month)}-${two(now.day)} ${two(now.hour)}:${two(now.minute)}');
+      '${now.year}-${two(now.month)}-${two(now.day)} ${two(now.hour)}:${two(now.minute)}',
+    );
     final freed = records.fold(0, (p, e) => p + e.size);
     buf.writeln('共删除 ${records.length} 个文件，释放 ${_fmt(freed)}');
     buf.writeln('---');
@@ -630,9 +640,12 @@ class _HomeScreenState extends State<HomeScreen> {
       for (final g in groups) {
         selections[g.key] = g.noAutoSelect
             ? <String>{}
-            : QualityService.autoSelectByRule(g.songs, keepBest: keepN,
+            : QualityService.autoSelectByRule(
+                g.songs,
+                keepBest: keepN,
                 rule: keepRuleNotifier.value,
-                preferredDir: keepDirNotifier.value);
+                preferredDir: keepDirNotifier.value,
+              );
       }
     });
   }
@@ -651,9 +664,9 @@ class _HomeScreenState extends State<HomeScreen> {
       status = '已忽略 1 组，剩余 ${groups.length} 组';
     });
     ScaffoldMessenger.of(context).clearSnackBars();
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('已忽略该组，可在设置中恢复')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('已忽略该组，可在设置中恢复')));
   }
 
   void _showDetailsSheet(SongFile s) {
@@ -669,7 +682,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void _showStatsSheet() {
     final byLabel = <String, List<SongFile>>{};
     for (final s in allSongs) {
-      byLabel.putIfAbsent(s.qualityLabel, () => []).add(s);
+      byLabel.putIfAbsent(s.effectiveQualityLabel, () => []).add(s);
     }
     const order = ['无损', '高音质', '标准', '较差'];
     final totalBytes = allSongs.fold(0, (p, e) => p + e.sizeBytes);
@@ -776,7 +789,9 @@ class _HomeScreenState extends State<HomeScreen> {
                       '待删清单（${toDelete.values.fold(0, (p, e) => p + e.length)} 个，'
                       '释放 ${_fmt(totalSelectedBytes)}）',
                       style: const TextStyle(
-                          fontSize: 15, fontWeight: FontWeight.bold),
+                        fontSize: 15,
+                        fontWeight: FontWeight.bold,
+                      ),
                     ),
                   ),
                   TextButton(
@@ -784,8 +799,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     child: const Text('取消'),
                   ),
                   FilledButton(
-                    style:
-                        FilledButton.styleFrom(backgroundColor: Colors.red),
+                    style: FilledButton.styleFrom(backgroundColor: Colors.red),
                     onPressed: () => Navigator.pop(c2, true),
                     child: const Text('移至回收站'),
                   ),
@@ -797,8 +811,9 @@ class _HomeScreenState extends State<HomeScreen> {
               child: Text(
                 '文件将移至回收站，可在 30 天内撤销恢复。每组保留规则：${_keepRuleLabel()}，每组保留 ${keepBestNotifier.value} 个。',
                 style: TextStyle(
-                    fontSize: 12,
-                    color: Theme.of(context).colorScheme.onSurfaceVariant),
+                  fontSize: 12,
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
               ),
             ),
             const SizedBox(height: 8),
@@ -808,8 +823,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 children: [
                   for (final e in toDelete.entries) ...[
                     Padding(
-                      padding:
-                          const EdgeInsets.fromLTRB(16, 8, 16, 2),
+                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 2),
                       child: Text(
                         e.key.reason,
                         style: TextStyle(
@@ -823,10 +837,12 @@ class _HomeScreenState extends State<HomeScreen> {
                       ListTile(
                         dense: true,
                         leading: const Icon(Icons.music_note_rounded, size: 20),
-                        title: Text(f.displayName,
-                            style: const TextStyle(fontSize: 13),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis),
+                        title: Text(
+                          f.displayName,
+                          style: const TextStyle(fontSize: 13),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
                         subtitle: Text(
                           '${f.formattedSize} · ${f.formattedBitrate} · ${f.path}',
                           style: const TextStyle(fontSize: 11),
@@ -874,6 +890,13 @@ class _HomeScreenState extends State<HomeScreen> {
       await TrashService.discardRecords(trashRecords);
       return;
     }
+    // 删除成功：先把被删的歌存一份删除备份到导出清单，
+    // 之后可从清单里恢复回收站里的歌。
+    final deletedSongs = toDelete.values
+        .expand((e) => e)
+        .where((s) => deleted.contains(s.path))
+        .toList();
+    await ExportListService.saveSongs(deletedSongs, source: 'delete');
     if (!mounted) return;
     // 删掉的文件可能正在试听：停掉播放器并清掉试听状态
     await _player.stop();
@@ -903,8 +926,9 @@ class _HomeScreenState extends State<HomeScreen> {
     final exportPath = await TrashService.exportList(trashRecords);
     if (!mounted) return;
     final deletedSet = deleted.toSet();
-    final deletedRecords =
-        trashRecords.where((r) => deletedSet.contains(r.originalPath)).toList();
+    final deletedRecords = trashRecords
+        .where((r) => deletedSet.contains(r.originalPath))
+        .toList();
     final freedBytes = deletedRecords.fold(0, (p, e) => p + e.size);
     await showDialog(
       context: context,
@@ -912,7 +936,8 @@ class _HomeScreenState extends State<HomeScreen> {
         title: const Text('已移至回收站'),
         content: Text(
           '共 ${deleted.length} 个文件，预计释放 ${_fmt(freedBytes)}。'
-          '${exportPath != null ? '\n清单已导出到 Download/清聆_回收站。' : ''}',
+          '${exportPath != null ? '\n清单已导出到 Download/清聆_回收站。' : ''}'
+          '\n删除备份已保存，可在导出清单中查看并恢复。',
         ),
         actions: [
           TextButton(
@@ -972,14 +997,15 @@ class _HomeScreenState extends State<HomeScreen> {
                 child: scanning
                     ? _buildScanning()
                     : groups.isEmpty
-                        ? _buildEmpty(scheme)
-                        : _buildResults(scheme, list),
+                    ? _buildEmpty(scheme)
+                    : _buildResults(scheme, list),
               ),
             ],
           ),
         ),
-        bottomNavigationBar:
-            (groups.isEmpty || scanning) ? null : _buildBottomBar(scheme),
+        bottomNavigationBar: (groups.isEmpty || scanning)
+            ? null
+            : _buildBottomBar(scheme),
       ),
     );
   }
@@ -995,8 +1021,7 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             Text(
               totalSongs > 0 ? '共 $totalSongs 首' : '正在扫描...',
-              style:
-                  const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 12),
             ClipRRect(
@@ -1008,11 +1033,8 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 12),
             Text(
-              scanPhase.isEmpty
-                  ? ''
-                  : '$scanPhase ${(scanProgress * 100).toStringAsFixed(0)}%',
-              style: TextStyle(
-                  fontSize: 13, color: scheme.onSurfaceVariant),
+              scanPhase,
+              style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
             ),
           ],
         ),
@@ -1055,9 +1077,10 @@ class _HomeScreenState extends State<HomeScreen> {
               context,
               MaterialPageRoute(
                 builder: (_) => SettingsScreen(
-                  onExportList: _exportDuplicateList,
-                  onShowDirStats: _showDirStats,
-                ),
+                      dirGroups: groups,
+                      totalBytes: allSongs.fold<int>(
+                          0, (a, s) => a + s.sizeBytes),
+                    ),
               ),
             ),
           ),
@@ -1081,19 +1104,25 @@ class _HomeScreenState extends State<HomeScreen> {
               TextSpan(
                 text: '$totalSongs',
                 style: TextStyle(
-                    fontWeight: FontWeight.w700, color: scheme.onSurface),
+                  fontWeight: FontWeight.w700,
+                  color: scheme.onSurface,
+                ),
               ),
               const TextSpan(text: ' 首 · '),
               TextSpan(
                 text: '${groups.length}',
                 style: TextStyle(
-                    fontWeight: FontWeight.w700, color: scheme.onSurface),
+                  fontWeight: FontWeight.w700,
+                  color: scheme.onSurface,
+                ),
               ),
               const TextSpan(text: ' 组重复 · 可释放 '),
               TextSpan(
                 text: _fmt(totalSelectedBytes),
                 style: TextStyle(
-                    fontWeight: FontWeight.w700, color: scheme.onSurface),
+                  fontWeight: FontWeight.w700,
+                  color: scheme.onSurface,
+                ),
               ),
             ],
           ),
@@ -1109,11 +1138,7 @@ class _HomeScreenState extends State<HomeScreen> {
         padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
         child: Row(
           children: [
-            MinimalChip(
-              label: '智能选中',
-              selected: true,
-              onTap: _smartSelect,
-            ),
+            MinimalChip(label: '智能选中', selected: true, onTap: _smartSelect),
             const SizedBox(width: 8),
             MinimalChip(
               label: '清空',
@@ -1160,8 +1185,11 @@ class _HomeScreenState extends State<HomeScreen> {
               decoration: InputDecoration(
                 hintText: '搜索歌曲/歌手…',
                 hintStyle: TextStyle(fontSize: 13, color: scheme.outline),
-                prefixIcon:
-                    Icon(Icons.search_rounded, size: 18, color: scheme.outline),
+                prefixIcon: Icon(
+                  Icons.search_rounded,
+                  size: 18,
+                  color: scheme.outline,
+                ),
                 suffixIcon: searchQuery.isNotEmpty
                     ? IconButton(
                         icon: const Icon(Icons.clear_rounded, size: 16),
@@ -1199,26 +1227,21 @@ class _HomeScreenState extends State<HomeScreen> {
         padding: const EdgeInsets.fromLTRB(20, 10, 20, 14),
         decoration: BoxDecoration(
           color: scheme.surface,
-          border: Border(
-            top: BorderSide(color: scheme.outlineVariant),
-          ),
+          border: Border(top: BorderSide(color: scheme.outlineVariant)),
         ),
         child: Row(
           children: [
             Text(
               '已选 ',
-              style:
-                  TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
+              style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
             ),
             Text(
               '$totalSelected',
-              style: const TextStyle(
-                  fontSize: 17, fontWeight: FontWeight.w700),
+              style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700),
             ),
             Text(
               ' 首',
-              style:
-                  TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
+              style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
             ),
             const Spacer(),
             MinimalIconButton(
@@ -1266,9 +1289,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     : null,
               ),
               child: Icon(
-                isNoDup
-                    ? Icons.check_rounded
-                    : Icons.music_note_rounded,
+                isNoDup ? Icons.check_rounded : Icons.music_note_rounded,
                 size: 32,
                 color: scheme.onSurfaceVariant,
               ),
@@ -1276,22 +1297,22 @@ class _HomeScreenState extends State<HomeScreen> {
             const SizedBox(height: 20),
             Text(
               isNoDup ? '没有重复项目' : '发现重复歌曲',
-              style: const TextStyle(
-                  fontSize: 17, fontWeight: FontWeight.w700),
+              style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700),
             ),
             const SizedBox(height: 6),
             Text(
               isNoDup ? '已扫描 $totalSongs 首，未发现重复歌曲。' : status,
               textAlign: TextAlign.center,
-              style:
-                  TextStyle(color: scheme.onSurfaceVariant, fontSize: 12),
+              style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 12),
             ),
             const SizedBox(height: 28),
             GestureDetector(
               onTap: _scan,
               child: Container(
                 padding: const EdgeInsets.symmetric(
-                    horizontal: 28, vertical: 14),
+                  horizontal: 28,
+                  vertical: 14,
+                ),
                 decoration: BoxDecoration(
                   color: primaryFillColor(context),
                   borderRadius: BorderRadius.circular(999),
@@ -1300,9 +1321,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     Icon(
-                      isNoDup
-                          ? Icons.refresh_rounded
-                          : Icons.radar_rounded,
+                      isNoDup ? Icons.refresh_rounded : Icons.radar_rounded,
                       size: 16,
                       color: onPrimaryFillColor(context),
                     ),
@@ -1329,10 +1348,7 @@ class _HomeScreenState extends State<HomeScreen> {
     // 统计/chips/搜索钉在顶部，不随滚动消失（顶栏已在外层）
     return Column(
       children: [
-        Align(
-          alignment: Alignment.centerLeft,
-          child: _buildStatsLine(scheme),
-        ),
+        Align(alignment: Alignment.centerLeft, child: _buildStatsLine(scheme)),
         _buildChipRow(scheme),
         _buildSearchRow(scheme),
         const SizedBox(height: 8),
@@ -1349,11 +1365,12 @@ class _HomeScreenState extends State<HomeScreen> {
                 selectedPaths: sel,
                 onToggle: (s, v) => _toggle(s, g.key, v),
                 onSelectWorst: () => setState(
-                  () => selections[g.key] =
-                      QualityService.autoSelectByRule(g.songs,
-                          keepBest: keepBestNotifier.value,
-                          rule: keepRuleNotifier.value,
-                          preferredDir: keepDirNotifier.value),
+                  () => selections[g.key] = QualityService.autoSelectByRule(
+                    g.songs,
+                    keepBest: keepBestNotifier.value,
+                    rule: keepRuleNotifier.value,
+                    preferredDir: keepDirNotifier.value,
+                  ),
                 ),
                 onInvert: () => setState(() {
                   final all = g.songs.map((e) => e.path).toSet();
@@ -1385,10 +1402,7 @@ class _SortMenuButton extends StatelessWidget {
   final String value;
   final ValueChanged<String> onChanged;
 
-  const _SortMenuButton({
-    required this.value,
-    required this.onChanged,
-  });
+  const _SortMenuButton({required this.value, required this.onChanged});
 
   static const _options = {
     'count': '按数量排序',
@@ -1405,8 +1419,10 @@ class _SortMenuButton extends StatelessWidget {
     final position = RelativeRect.fromRect(
       Rect.fromPoints(
         button.localToGlobal(Offset.zero, ancestor: overlay),
-        button.localToGlobal(button.size.bottomRight(Offset.zero),
-            ancestor: overlay),
+        button.localToGlobal(
+          button.size.bottomRight(Offset.zero),
+          ancestor: overlay,
+        ),
       ),
       Offset.zero & overlay.size,
     );
@@ -1425,8 +1441,7 @@ class _SortMenuButton extends StatelessWidget {
           if (i > 0) const PopupMenuDivider(height: 1),
           PopupMenuItem<String>(
             value: entries[i].key,
-            padding:
-                const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -1444,8 +1459,7 @@ class _SortMenuButton extends StatelessWidget {
                 ),
                 if (entries[i].key == value) ...[
                   const SizedBox(width: 8),
-                  Icon(Icons.check_rounded,
-                      size: 14, color: scheme.onSurface),
+                  Icon(Icons.check_rounded, size: 14, color: scheme.onSurface),
                 ],
               ],
             ),

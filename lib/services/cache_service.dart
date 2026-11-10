@@ -2,16 +2,19 @@ import 'dart:io';
 
 import 'package:path_provider/path_provider.dart';
 
-/// 扫描缓存管理：指纹 / chroma 声学 / 封面歌词三项 JSON 缓存。
+/// 扫描缓存管理：扫描结果 / 文件指纹 / chroma 声学 / 封面歌词四项 JSON 缓存。
 ///
 /// 所有缓存的 key 都绑定了 path + mtime（封面歌词还绑定 size），
 /// 文件内容一变就自动失效重算，所以：
 /// - 缓存不会影响扫描结果的可信度，只跳过"没变过的文件"的重复计算；
-/// - 清除缓存只会让下次扫描变慢，结果完全不受影响。
+/// - 清除缓存只会让下次扫描变慢（增量变全量），结果完全不受影响。
+/// - 算法改动后需手动清除：旧缓存的分组结果按旧算法算出，不会自动更新。
 class CacheService {
   static const _names = [
+    'scan_cache.json', // 扫描结果（增量扫描依据）
     'fingerprint_cache.json', // 文件指纹（Tier 4）
     'chroma_fp_cache.json', // 同名组声学细分指纹
+    'spectral_cache.json', // 频谱截止（假无损检测）
     'media_tags_cache.json', // 封面/歌词检测
   ];
 

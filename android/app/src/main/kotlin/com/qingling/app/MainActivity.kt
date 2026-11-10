@@ -1,4 +1,4 @@
-package com.example.song_dedup
+package com.qingling.app
 
 import android.Manifest
 import android.app.Activity
@@ -22,6 +22,8 @@ import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import android.util.Log
 import android.net.Uri
+import androidx.core.content.FileProvider
+import java.io.File
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -29,12 +31,18 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : FlutterActivity() {
     private var pendingResult: MethodChannel.Result? = null
     private var pendingDeletePaths: List<String> = emptyList()
+    // MediaStore 删除请求被用户取消时，直接删除的部分已删，需如实返回
+    private var pendingDirectDeleted: List<String> = emptyList()
     private val deleteRequestCode = 1001
+    // 文件系统直扫认的音频扩展名（与 Dart 层 audioExts 保持一致）
+    private val fsAudioExts = setOf(
+        "mp3", "flac", "wav", "m4a", "aac", "ogg", "wma", "opus", "aiff", "mp2"
+    )
     private var debugChannel: MethodChannel? = null
     private val debugReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
-                "com.example.song_dedup.DEBUG_SCAN" -> {
+                "com.qingling.app.DEBUG_SCAN" -> {
                     Log.d("song_dedup", "DEBUG_SCAN received, channel=${if (debugChannel == null) "null" else "ok"}")
                     debugChannel?.invokeMethod("startScan", null)
                 }
@@ -60,14 +68,35 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    /// 调系统安装器安装指定 APK（更新用）。FileProvider 授临时读权限，
+    /// 首次安装系统会让用户确认允许「安装未知应用」。
+    private fun installApk(path: String): Boolean {
+        return try {
+            val file = File(path)
+            if (!file.exists()) return false
+            val uri = FileProvider.getUriForFile(
+                this, "${applicationContext.packageName}.fileprovider", file)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(intent)
+            true
+        } catch (e: Exception) {
+            Log.w("song_dedup", "installApk failed: ${e.message}")
+            false
+        }
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
         // Debug channel: automation can trigger a scan with
-        // `adb shell am broadcast -a com.example.song_dedup.DEBUG_SCAN`
+        // `adb shell am broadcast -a com.qingling.app.DEBUG_SCAN`
         debugChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "song_dedup/debug")
         val debugFilter = IntentFilter().apply {
-            addAction("com.example.song_dedup.DEBUG_SCAN")
+            addAction("com.qingling.app.DEBUG_SCAN")
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(debugReceiver, debugFilter, Context.RECEIVER_EXPORTED) // debug receiver for adb testing; must be exported to receive shell broadcasts
@@ -75,11 +104,22 @@ class MainActivity : FlutterActivity() {
             registerReceiver(debugReceiver, debugFilter)
         }
 
-        // Scanner channel
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "song_dedup/scanner")
+        // Scanner channel（存引用，供后台扫描线程上报进度）
+        val scannerChannel =
+            MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "song_dedup/scanner")
+        scannerChannel
             .setMethodCallHandler { call, result ->
                 if (call.method == "querySongs") {
                     querySongs(result)
+                } else if (call.method == "querySongsFromFs") {
+                    @Suppress("UNCHECKED_CAST")
+                    val dirs = (call.argument<List<String>>("dirs") ?: emptyList())
+                    @Suppress("UNCHECKED_CAST")
+                    val cached = (call.argument<Map<String, List<Int>>>("cached")
+                        ?: emptyMap())
+                    val expectedTotal =
+                        (call.argument<Int>("expectedTotal") ?: 0)
+                    querySongsFromFs(dirs, cached, expectedTotal, scannerChannel, result)
                 } else if (call.method == "audioDetails") {
                     val id = call.argument<Number>("id")?.toLong() ?: 0L
                     val path = call.argument<String>("path")
@@ -118,6 +158,14 @@ class MainActivity : FlutterActivity() {
                     } else {
                         result.error("ARG_ERROR", "path null", null)
                     }
+                } else if (call.method == "spectralCutoff") {
+                    val id = call.argument<Number>("id")?.toLong() ?: 0L
+                    val path = call.argument<String>("path")
+                    if (path != null) {
+                        spectralCutoff(id, path, result)
+                    } else {
+                        result.error("ARG_ERROR", "path null", null)
+                    }
                 } else if (call.method == "shareText") {
                     val text = call.argument<String>("text")
                     val title = call.argument<String>("title") ?: "分享"
@@ -141,6 +189,13 @@ class MainActivity : FlutterActivity() {
                     } else {
                         result.error("ARG_ERROR", "path null", null)
                     }
+                } else if (call.method == "installApk") {
+                    val path = call.argument<String>("path")
+                    if (path != null) {
+                        result.success(installApk(path))
+                    } else {
+                        result.error("ARG_ERROR", "path null", null)
+                    }
                 } else {
                     result.notImplemented()
                 }
@@ -158,28 +213,6 @@ class MainActivity : FlutterActivity() {
                     result.notImplemented()
                 }
             }
-    }
-
-    private fun triggerScanForMissing() {
-        try {
-            fun collect(dir: java.io.File, out: MutableList<java.io.File>) {
-                val list = dir.listFiles() ?: return
-                for (f in list) {
-                    if (f.isDirectory) collect(f, out)
-                    else if (f.name.contains("(1)") && (f.name.endsWith(".mp3") || f.name.endsWith(".flac") || f.name.endsWith(".m4a") || f.name.endsWith(".wav"))) out.add(f)
-                }
-            }
-            val musicDir = java.io.File("/storage/emulated/0/Music")
-            if (musicDir.exists()) {
-                val out = mutableListOf<java.io.File>()
-                collect(musicDir, out)
-                for (f in out.take(50)) {
-                    MediaScannerConnection.scanFile(this, arrayOf(f.absolutePath), null, null)
-                }
-                // 给 MediaStore 一点时间入庫，避免本次查询仍漏掉
-                try { Thread.sleep(400) } catch (_: Exception) {}
-            }
-        } catch (_: Exception) {}
     }
 
     /// 查询所有 .lrc 歌词文件（MediaStore.Files）
@@ -264,8 +297,419 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    /// 文件系统直扫：对给定目录递归列文件，不依赖 MediaStore 枚举。
+    ///
+    /// 背景：MediaStore 经常漏索引文件（尤其是经 MTP/adb 拷入的 (1)~(5) 副本），
+    /// total 始终 3133 而 /Music/ 下实际 3262 首。文件在磁盘上就一定能扫到。
+    /// 元数据优先查 MediaStore（by path）；查不到的用 MediaMetadataRetriever
+    /// 直接读文件；再查不到的从文件名解析 `歌手-标题`。
+    /// dirs 为空 = 全部目录（扫描 /storage/emulated/0，跳过 Android/ 与隐藏目录）。
+    /// 跑在后台线程，避免阻塞 UI。
+    /// 文件系统直扫。`cached` 是 Dart 层传来的上次扫描缓存
+    /// （path → [dateModified(秒), sizeBytes]）：mtime+size 都对上
+    /// 的文件跳过读元数据、只回 path + cached 标记，Dart 层直接用
+    /// 缓存的 SongFile；新增/变更的文件才走 metadataForFile。
+    /// 处理中定期向 Dart 上报进度（scanProgress），供进度条实时推进。
+    /// 文件系统直扫。`cached` 是 Dart 层传来的上次扫描缓存
+    /// （path → [dateModified(秒), sizeBytes]）：mtime+size 都对上
+    /// 的文件跳过读元数据、只回 path + cached 标记，Dart 层直接用
+    /// 缓存的 SongFile；新增/变更的文件才走 metadataForFile。
+    /// 处理中定期向 Dart 上报进度（scanProgress），供进度条实时推进。
+    /// 遍历目录（walk，约占媒体扫描大半时间）与读元数据（meta）分两段上报，
+    /// 否则遍历那 9 秒进度条一直停在 0。
+    private fun querySongsFromFs(
+        dirs: List<String>,
+        cached: Map<String, List<Int>>,
+        expectedTotal: Int,
+        channel: MethodChannel,
+        result: MethodChannel.Result
+    ) {
+        Thread {
+            try {
+                val roots = if (dirs.isEmpty()) {
+                    listOf("/storage/emulated/0")
+                } else {
+                    dirs
+                }
+                val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+                fun reportProgress(stage: String, processed: Int, total: Int) {
+                    mainHandler.post {
+                        try {
+                            channel.invokeMethod(
+                                "scanProgress",
+                                mapOf(
+                                    "stage" to stage,
+                                    "processed" to processed,
+                                    "total" to total
+                                )
+                            )
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+                val files = mutableListOf<java.io.File>()
+                val visited = mutableSetOf<String>()
+                // 遍历中每发现 50 个音频文件上报一次（分母用上次扫描总数估算）。
+                // 间隔不能太大：总数 3187 时若每 200 报一次，3000 之后
+                // 要到 3200 才再报、永远到不了，看着像卡在 3000。
+                var found = 0
+                for (root in roots) {
+                    collectAudioFiles(java.io.File(root), files, visited) {
+                        found++
+                        if (found % 50 == 0) {
+                            reportProgress("walk", found, expectedTotal)
+                        }
+                    }
+                }
+                val total = files.size
+                reportProgress("walk", total, total)
+                val list = mutableListOf<Map<String, Any>>()
+                var processed = 0
+                for (f in files) {
+                    try {
+                        val path = f.absolutePath
+                        val entry = cached[path]
+                        // mtime（秒）+ 大小都对上 → 未变，跳过读元数据
+                        if (entry != null && entry.size >= 2 &&
+                            (f.lastModified() / 1000) == entry[0].toLong() &&
+                            f.length() == entry[1].toLong()
+                        ) {
+                            list.add(mapOf("path" to path, "cached" to true))
+                        } else {
+                            list.add(metadataForFile(f))
+                        }
+                    } catch (_: Exception) {
+                        // 单个文件失败不影响整体
+                    }
+                    processed++
+                    // 每 50 首上报一次，末尾必报
+                    if (processed % 50 == 0 || processed == total) {
+                        reportProgress("meta", processed, total)
+                    }
+                }
+                result.success(list)
+            } catch (e: Exception) {
+                result.error("FS_QUERY_ERROR", e.message, null)
+            }
+        }.start()
+    }
+
+    /// 递归收集音频文件。跳过隐藏目录、Android/ 目录（应用私有数据，
+    /// 无权访问且无音乐），用 canonical 路径去重防符号链接循环。
+    /// 每发现一个音频文件调一次 [onFound]（供遍历进度上报）。
+    private fun collectAudioFiles(
+        dir: java.io.File,
+        out: MutableList<java.io.File>,
+        visited: MutableSet<String>,
+        onFound: () -> Unit = {}
+    ) {
+        try {
+            if (!dir.exists() || !dir.isDirectory) return
+            val canon = try { dir.canonicalPath } catch (_: Exception) { dir.absolutePath }
+            if (!visited.add(canon)) return
+            val list = dir.listFiles() ?: return
+            for (f in list) {
+                try {
+                    if (f.isDirectory) {
+                        val name = f.name
+                        if (name.startsWith(".")) continue
+                        if (name == "Android") continue
+                        collectAudioFiles(f, out, visited, onFound)
+                    } else if (f.isFile) {
+                        val lower = f.name.lowercase()
+                        if (fsAudioExts.any { lower.endsWith(".$it") }) {
+                            out.add(f)
+                            onFound()
+                        }
+                    }
+                } catch (_: Exception) {
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    /// 单个文件的元数据：MediaStore by path → MediaMetadataRetriever → 文件名解析。
+    /// 返回的 map 与 querySongs 相同的 key，Dart 层共用解析逻辑。
+    private fun metadataForFile(f: java.io.File): Map<String, Any> {
+        val path = f.absolutePath
+        // 1. MediaStore by path（时长有效才用）。MediaStore 有 13 首
+        // MP3 的 duration 是 NULL（解析失败），直接返回会带 duration=0，
+        // 被 Dart 层按无时长过滤掉；此时继续走 MMR 直接读文件取时长。
+        // 注意：即使时长无效也要留住 MediaStore 的 id——MMR 兜底路径
+        // 返回 id=0 的话，删除时会被分到直接删文件，而 App 无权直接删
+        // 共享存储文件（静默失败），只能走 MediaStore 删除请求。
+        val msRow = mediaStoreRowForPath(path)
+        if (msRow != null && (msRow["duration"] as? Int ?: 0) > 0) {
+            // MediaStore 的 DATE_MODIFIED / SIZE 不随文件实际修改更新
+            // （adb touch / 改内容不触发 MediaScanner），用文件实际
+            // mtime 与大小覆盖，否则增量扫描永远检不出变更。
+            return msRow + mapOf(
+                "dateModified" to (f.lastModified() / 1000),
+                "size" to f.length().toInt()
+            )
+        }
+        val msId = (msRow?.get("id") as? Int) ?: 0
+        // 2. MediaMetadataRetriever 直接读文件
+        var title = ""
+        var artist = ""
+        var album = ""
+        var durationMs = 0L
+        var bitrate = 0
+        try {
+            val mmr = MediaMetadataRetriever()
+            try {
+                mmr.setDataSource(path)
+                title = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE) ?: ""
+                artist = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST) ?: ""
+                album = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUM) ?: ""
+                durationMs = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                bitrate = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toIntOrNull() ?: 0
+            } finally {
+                try { mmr.release() } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {
+        }
+        // 3. MMR 也读不出时长时，从文件头直接读：
+        // ASF/WMA（文件实际是 ASF/WMA 却标着 .mp3 后缀，MediaStore 与
+        // MMR 都被后缀骗了）读 ASF 文件属性对象；AIFF（MMR 不支持）
+        // 读 COMM 块的帧数 ÷ 采样率。仍为 0 才由 Dart 层按无时长过滤。
+        if (durationMs <= 0) {
+            durationMs = asfDurationMs(f)
+        }
+        if (durationMs <= 0) {
+            durationMs = aiffDurationMs(f)
+        }
+        // 4. 文件名解析 `歌手-标题`
+        if (title.isBlank()) {
+            val (a, t) = parseFilename(f.name)
+            if (artist.isBlank()) artist = a
+            title = t
+        }
+        if (artist.isBlank()) artist = "<unknown>"
+        return mapOf(
+            "id" to msId,
+            "displayName" to f.name,
+            "title" to title,
+            "artist" to artist,
+            "album" to album,
+            "duration" to durationMs.toInt(),
+            "size" to f.length().toInt(),
+            "path" to path,
+            // File.lastModified() 是毫秒，MediaStore DATE_MODIFIED 是秒，统一成秒
+            "dateModified" to (f.lastModified() / 1000),
+            "bitrate" to bitrate
+        )
+    }
+
+    /// MediaStore 按 DATA 列精确查一行。查到返回与 querySongs 同格式的 map，
+    /// 查不到返回 null（文件未被 MediaStore 索引）。
+    private fun mediaStoreRowForPath(path: String): Map<String, Any>? {
+        val uri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+        val projection = arrayOf(
+            MediaStore.Audio.Media._ID,
+            MediaStore.Audio.Media.DISPLAY_NAME,
+            MediaStore.Audio.Media.TITLE,
+            MediaStore.Audio.Media.ARTIST,
+            MediaStore.Audio.Media.ALBUM,
+            MediaStore.Audio.Media.DURATION,
+            MediaStore.Audio.Media.SIZE,
+            MediaStore.Audio.Media.DATA,
+            MediaStore.Audio.Media.DATE_MODIFIED
+        )
+        try {
+            contentResolver.query(
+                uri, projection,
+                "${MediaStore.Audio.Media.DATA} = ?",
+                arrayOf(path), null
+            )?.use { cursor ->
+                if (!cursor.moveToFirst()) return null
+                val idCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
+                val displayNameCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME)
+                val titleCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE)
+                val artistCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST)
+                val albumCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM)
+                val durationCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
+                val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.SIZE)
+                val dataCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA)
+                val dateModifiedCol = cursor.getColumnIndex(MediaStore.Audio.Media.DATE_MODIFIED)
+                val bitrateCol = cursor.getColumnIndex("bitrate")
+                val map = hashMapOf<String, Any>()
+                map["id"] = cursor.getLong(idCol).toInt()
+                map["displayName"] = cursor.getString(displayNameCol) ?: ""
+                map["title"] = cursor.getString(titleCol) ?: ""
+                map["artist"] = cursor.getString(artistCol) ?: "<unknown>"
+                map["album"] = cursor.getString(albumCol) ?: ""
+                map["duration"] = cursor.getLong(durationCol).toInt()
+                map["size"] = cursor.getLong(sizeCol).toInt()
+                map["path"] = cursor.getString(dataCol) ?: ""
+                map["dateModified"] = if (dateModifiedCol != -1) cursor.getLong(dateModifiedCol) else 0L
+                map["bitrate"] = if (bitrateCol != -1) cursor.getInt(bitrateCol) else 0
+                return map
+            }
+        } catch (_: Exception) {
+        }
+        return null
+    }
+
+    /// ASF/WMA 文件被误标为 .mp3 时从 ASF 头读时长。文件可能先带一段
+    /// ID3v2 标签，ASF 头在标签之后。时长在文件属性对象（File Properties
+    /// Object）里，单位 100ns。不是 ASF 或读不到返回 0。
+    private fun asfDurationMs(f: java.io.File): Long {
+        // ASF Header Object GUID
+        val asfGuid = byteArrayOf(
+            0x30, 0x26, 0xB2.toByte(), 0x75, 0x8E.toByte(), 0x66,
+            0xCF.toByte(), 0x11, 0xA6.toByte(), 0xD9.toByte(), 0x00,
+            0xAA.toByte(), 0x00, 0x62, 0xCE.toByte(), 0x6C
+        )
+        // File Properties Object GUID
+        val fpGuid = byteArrayOf(
+            0xA1.toByte(), 0xDC.toByte(), 0xAB.toByte(), 0x8C.toByte(),
+            0x47, 0xA9.toByte(), 0xCF.toByte(), 0x11, 0x8E.toByte(),
+            0xE4.toByte(), 0x00, 0xC0.toByte(), 0x0C, 0x20, 0x53, 0x65
+        )
+        return try {
+            val bytes = f.readBytes()
+            var i = 0
+            // 跳过 ID3v2 标签头（10 字节 + synchsafe 长度）
+            if (bytes.size >= 10 && bytes[0] == 'I'.code.toByte() &&
+                bytes[1] == 'D'.code.toByte() && bytes[2] == '3'.code.toByte()
+            ) {
+                val size = ((bytes[6].toInt() and 0x7f) shl 21) or
+                    ((bytes[7].toInt() and 0x7f) shl 14) or
+                    ((bytes[8].toInt() and 0x7f) shl 7) or
+                    (bytes[9].toInt() and 0x7f)
+                i = 10 + size
+            }
+            if (i + 30 > bytes.size) return 0L
+            for (k in asfGuid.indices) {
+                if (bytes[i + k] != asfGuid[k]) return 0L
+            }
+            // Header Object：size(8) @+16，子对象数(4) @+24，子对象从 +30 开始
+            var hdrSize = 0L
+            for (k in 0 until 8) {
+                hdrSize = hdrSize or
+                    ((bytes[i + 16 + k].toLong() and 0xFF) shl (8 * k))
+            }
+            var numObj = 0
+            for (k in 0 until 4) {
+                numObj = numObj or
+                    ((bytes[i + 24 + k].toInt() and 0xFF) shl (8 * k))
+            }
+            val end = (i + hdrSize).coerceAtMost(bytes.size.toLong()).toInt()
+            var p = i + 30
+            repeat(numObj) {
+                if (p + 24 > end) return 0L
+                var sz = 0L
+                for (k in 0 until 8) {
+                    sz = sz or
+                        ((bytes[p + 16 + k].toLong() and 0xFF) shl (8 * k))
+                }
+                var isFp = true
+                for (k in fpGuid.indices) {
+                    if (bytes[p + k] != fpGuid[k]) { isFp = false; break }
+                }
+                if (isFp) {
+                    // File Properties：GUID(16)+size(8)+file_id(16)+
+                    // file_size(8)+creation(8)+packets(8)+play_duration(8)
+                    // +send_duration(8)+preroll(8)。
+                    // play_duration 含编码器 preroll（ffmpeg 写的 WMA 会多
+                    // 出约 3 秒），用 send_duration（真实音频时长）为准，
+                    // 读不到再回落 play_duration。
+                    var play = 0L
+                    for (k in 0 until 8) {
+                        play = play or
+                            ((bytes[p + 64 + k].toLong() and 0xFF) shl (8 * k))
+                    }
+                    var send = 0L
+                    for (k in 0 until 8) {
+                        send = send or
+                            ((bytes[p + 72 + k].toLong() and 0xFF) shl (8 * k))
+                    }
+                    val dur = if (send > 0) send else play
+                    return dur / 10000 // 100ns -> ms
+                }
+                p += sz.toInt()
+            }
+            0L
+        } catch (_: Exception) {
+            0L
+        }
+    }
+
+    /// AIFF 时长兜底：MMR 读不出 AIFF 时长（MediaStore 也是 NULL），
+    /// 直接解析 AIFF 头：COMM 块里的帧数 ÷ 采样率。
+    /// 采样率是 80 位 IEEE 扩展浮点（大端：符号 1 位 + 指数 15 位，
+    /// 偏置 16383 + 尾数 64 位，含显式整数位）。
+    private fun aiffDurationMs(f: java.io.File): Long {
+        return try {
+            val bytes = f.readBytes()
+            if (bytes.size < 54) return 0L
+            // FORM(4) + size(4) + AIFF/AIFC(4)
+            if (!(bytes[0] == 'F'.code.toByte() && bytes[1] == 'O'.code.toByte() &&
+                  bytes[2] == 'R'.code.toByte() && bytes[3] == 'M'.code.toByte())) return 0L
+            val formType = String(bytes, 8, 4, Charsets.US_ASCII)
+            if (formType != "AIFF" && formType != "AIFC") return 0L
+            // 找 COMM 块（块大小大端，奇数补 1 字节对齐）
+            var p = 12
+            while (p + 8 <= bytes.size) {
+                val id = String(bytes, p, 4, Charsets.US_ASCII)
+                val sz = ((bytes[p + 4].toLong() and 0xFF) shl 24) or
+                    ((bytes[p + 5].toLong() and 0xFF) shl 16) or
+                    ((bytes[p + 6].toLong() and 0xFF) shl 8) or
+                    (bytes[p + 7].toLong() and 0xFF)
+                if (id == "COMM") {
+                    // COMM 数据：channels(2) + frames(4) + sampleSize(2)
+                    // + sampleRate(10)，共 18 字节
+                    if (p + 26 > bytes.size) return 0L
+                    val frames = ((bytes[p + 10].toLong() and 0xFF) shl 24) or
+                        ((bytes[p + 11].toLong() and 0xFF) shl 16) or
+                        ((bytes[p + 12].toLong() and 0xFF) shl 8) or
+                        (bytes[p + 13].toLong() and 0xFF)
+                    val rate = decodeExtended80(bytes, p + 16)
+                    if (frames <= 0 || rate <= 0.0) return 0L
+                    return (frames * 1000.0 / rate).toLong()
+                }
+                p += 8 + sz.toInt() + (if (sz % 2 == 1L) 1 else 0)
+            }
+            0L
+        } catch (_: Exception) {
+            0L
+        }
+    }
+
+    /// 解 80 位 IEEE 扩展浮点（大端）。
+    private fun decodeExtended80(bytes: ByteArray, off: Int): Double {
+        if (off + 10 > bytes.size) return 0.0
+        val sign = if (bytes[off].toInt() and 0x80 != 0) -1.0 else 1.0
+        val exp = (((bytes[off].toInt() and 0x7F) shl 8) or
+            (bytes[off + 1].toInt() and 0xFF)) - 16383
+        // 尾数：64 位大端整数，实际值 = mant / 2^63 * 2^exp
+        var mant = 0.0
+        for (k in 0 until 8) {
+            mant = mant * 256.0 + (bytes[off + 2 + k].toInt() and 0xFF)
+        }
+        return sign * mant * Math.pow(2.0, (exp - 63).toDouble())
+    }
+
+    /// 文件名解析 `歌手-标题`：优先 ` - `（空格-空格），其次第一个 `-`。
+    /// 无分隔符时标题 = 去扩展名文件名，歌手 = <unknown>。
+    /// 不去掉 (1) 等下载副本后缀——Dart 层版本标记会处理。
+    private fun parseFilename(name: String): Pair<String, String> {
+        val base = name.substringBeforeLast('.')
+        val sep = when {
+            base.contains(" - ") -> " - "
+            base.contains("-") -> "-"
+            else -> null
+        }
+        if (sep == null) return "<unknown>" to base.trim()
+        val artist = base.substringBefore(sep).trim()
+        val title = base.substringAfter(sep).trim()
+        return (if (artist.isEmpty()) "<unknown>" else artist) to
+            (if (title.isEmpty()) base.trim() else title)
+    }
+
     private fun querySongs(result: MethodChannel.Result) {
-        triggerScanForMissing()
         try {
             val collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
             val projection = arrayOf(
@@ -634,6 +1078,79 @@ class MainActivity : FlutterActivity() {
         }.start()
     }
 
+    /// 频谱截止频率：假无损检测用。解码 3 段（25%/50%/75%，各 5 秒），
+    /// 每窗 4096 点 Hann + FFT，找能量高于峰值 -60dB 的最高频点；
+    /// 取全部窗口截止频率的 90 分位——真无损偶有高频、假无损从不
+    /// 超过转码时的截止线，90 分位既抗静音段干扰又不被个别瞬态带偏。
+    /// 返回 map：cutoffHz（90 分位）、sampleRate、windows（窗口数）。
+    private fun spectralCutoff(id: Long, path: String, result: MethodChannel.Result) {
+        Thread {
+            try {
+                result.success(doSpectralCutoff(id, path))
+            } catch (e: Exception) {
+                result.error("SPECTRAL_ERROR", e.message, null)
+            }
+        }.start()
+    }
+
+    private fun doSpectralCutoff(id: Long, path: String): Map<String, Any> {
+        val cutoffs = mutableListOf<Double>()
+        var sampleRate = 0
+        for (f in doubleArrayOf(0.25, 0.5, 0.75)) {
+            val seg = decodeMonoSegment(id, path, f, 5)
+            sampleRate = seg.sampleRate
+            cutoffs.addAll(spectralCutoffsOfSegment(seg))
+        }
+        if (cutoffs.isEmpty()) throw IllegalStateException("decoded too few samples")
+        cutoffs.sort()
+        val idx = ((cutoffs.size - 1) * 0.9).toInt()
+        return mapOf(
+            "cutoffHz" to cutoffs[idx],
+            "sampleRate" to sampleRate,
+            "windows" to cutoffs.size
+        )
+    }
+
+    /// 单段各窗口的截止频率：4096 点 Hann + FFT，截止频点为能量高于
+    /// 窗口峰值 -60dB（0.1%）的最高 bin 对应频率。
+    private fun spectralCutoffsOfSegment(seg: MonoSegment): List<Double> {
+        val n = 4096
+        val hop = 2048
+        val re = DoubleArray(n)
+        val im = DoubleArray(n)
+        val win = DoubleArray(n) { i ->
+            0.5 - 0.5 * kotlin.math.cos(2.0 * kotlin.math.PI * i / (n - 1))
+        }
+        val out = mutableListOf<Double>()
+        var pos = 0
+        while (pos + n <= seg.filled) {
+            for (i in 0 until n) {
+                re[i] = seg.samples[pos + i] * win[i]
+                im[i] = 0.0
+            }
+            fft(re, im, n)
+            var peak = 0.0
+            val mag = DoubleArray(n / 2)
+            for (b in 1 until n / 2) {
+                val m = kotlin.math.sqrt(re[b] * re[b] + im[b] * im[b])
+                mag[b] = m
+                if (m > peak) peak = m
+            }
+            if (peak > 0.0) {
+                val thresh = peak * 0.001 // -60dB
+                var cutoffBin = 0
+                for (b in n / 2 - 1 downTo 1) {
+                    if (mag[b] > thresh) { cutoffBin = b; break }
+                }
+                if (cutoffBin > 0) {
+                    out.add(cutoffBin * seg.sampleRate.toDouble() / n)
+                }
+            }
+            pos += hop
+        }
+        return out
+    }
+
     private fun doChromaFingerprint(id: Long, path: String): Map<String, Any> {
         val out = mutableListOf<Double>()
         var windows = 0
@@ -691,14 +1208,29 @@ class MainActivity : FlutterActivity() {
             return
         }
 
+        // 文件系统直扫的文件可能不在 MediaStore 里（id=0），MediaStore 删除请求
+        // 对它们无效。id<=0 的直接删文件，id>0 的走 MediaStore 删除请求。
+        val paired = ids.zip(paths)
+        val fsOnlyPaths = paired.filter { it.first <= 0 }.map { it.second }
+        val directDeleted = directDelete(fsOnlyPaths).toMutableList()
+        val valid = paired.filter { it.first > 0 }
+        if (valid.isEmpty()) {
+            result.success(directDeleted)
+            return
+        }
+        val validIds = valid.map { it.first }
+        val validPaths = valid.map { it.second }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             try {
-                val uris = ids.map { id ->
+                val uris = validIds.map { id ->
                     Uri.withAppendedPath(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id.toString())
                 }
                 val pendingIntent = MediaStore.createDeleteRequest(contentResolver, uris)
                 pendingResult = result
-                pendingDeletePaths = paths
+                // MediaStore 删除确认后返回全部已删路径（含直接删除的）
+                pendingDeletePaths = validPaths + directDeleted
+                pendingDirectDeleted = directDeleted
                 startIntentSenderForResult(
                     pendingIntent.intentSender,
                     deleteRequestCode,
@@ -709,25 +1241,26 @@ class MainActivity : FlutterActivity() {
             }
         } else if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q) {
             try {
-                val uris = ids.map { id ->
+                val uris = validIds.map { id ->
                     Uri.withAppendedPath(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id.toString())
                 }
                 val pendingIntent = MediaStore.createDeleteRequest(contentResolver, uris)
                 pendingResult = result
-                pendingDeletePaths = paths
+                pendingDeletePaths = validPaths + directDeleted
+                pendingDirectDeleted = directDeleted
                 startIntentSenderForResult(
                     pendingIntent.intentSender,
                     deleteRequestCode,
                     null, 0, 0, 0, null
                 )
             } catch (e: Exception) {
-                val deleted = directDelete(paths)
-                result.success(deleted)
+                val deleted = directDelete(validPaths)
+                result.success(deleted + directDeleted)
             }
         } else {
-            val deleted = directDelete(paths)
+            val deleted = directDelete(validPaths)
             // 同时尝试通过 ContentResolver 删除 MediaStore 记录
-            for (id in ids) {
+            for (id in validIds) {
                 try {
                     contentResolver.delete(
                         Uri.withAppendedPath(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id.toString()),
@@ -735,7 +1268,7 @@ class MainActivity : FlutterActivity() {
                     )
                 } catch (_: Exception) {}
             }
-            result.success(deleted)
+            result.success(deleted + directDeleted)
         }
     }
 
@@ -765,10 +1298,12 @@ class MainActivity : FlutterActivity() {
             if (resultCode == Activity.RESULT_OK) {
                 pendingResult?.success(pendingDeletePaths)
             } else {
-                pendingResult?.success(emptyList<String>())
+                // 用户取消：MediaStore 部分没删，但直接删除的已经删了，如实返回
+                pendingResult?.success(pendingDirectDeleted)
             }
             pendingResult = null
             pendingDeletePaths = emptyList()
+            pendingDirectDeleted = emptyList()
         }
     }
 }

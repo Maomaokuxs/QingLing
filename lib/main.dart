@@ -17,6 +17,13 @@ final ValueNotifier<bool> crossLingualEnabledNotifier = ValueNotifier(false);
 /// 清单语义：勾上就是扫，不勾就是不扫。
 final ValueNotifier<bool> scanAllDirsNotifier = ValueNotifier(true);
 final ValueNotifier<List<String>> scanDirsNotifier = ValueNotifier([]);
+/// 扫描短音频开关：默认关闭（短于 30 秒的不扫）；打开后也扫描 30 秒以下的
+/// 短音频（游戏 BGM、片段等），扫描总数会变多。
+final ValueNotifier<bool> includeShortSongsNotifier = ValueNotifier(false);
+/// 假无损检测开关：默认关闭。打开后扫描时对组内无损文件做频谱分析，
+/// 截止明显低于奈奎斯特的判疑似假无损、有效音质分降级；扫描变慢
+/// （组内无损文件每首多解码 3 段，首扫约 +26s，后续走缓存）。
+final ValueNotifier<bool> spectralEnabledNotifier = ValueNotifier(false);
 /// 每组保留的音质最佳版本数（1~3）
 final ValueNotifier<int> keepBestNotifier = ValueNotifier(1);
 /// 保留规则：quality=音质优先，lossless=优先无损，dir=优先指定目录
@@ -35,6 +42,10 @@ Future<void> _loadSettings() async {
   if (fp != null) fingerprintEnabledNotifier.value = fp;
   final cl = prefs.getBool('crosslingual_enabled');
   if (cl != null) crossLingualEnabledNotifier.value = cl;
+  includeShortSongsNotifier.value =
+      prefs.getBool('include_short_songs') ?? false;
+  spectralEnabledNotifier.value =
+      prefs.getBool('spectral_enabled') ?? false;
   final tm = prefs.getString('theme_mode');
   if (tm != null) {
     themeModeNotifier.value = switch (tm) {
@@ -83,6 +94,12 @@ Future<void> _loadSettings() async {
   crossLingualEnabledNotifier.addListener(() {
     SharedPreferences.getInstance().then((p) => p.setBool('crosslingual_enabled', crossLingualEnabledNotifier.value));
   });
+  includeShortSongsNotifier.addListener(() {
+    SharedPreferences.getInstance().then((p) => p.setBool('include_short_songs', includeShortSongsNotifier.value));
+  });
+  spectralEnabledNotifier.addListener(() {
+    SharedPreferences.getInstance().then((p) => p.setBool('spectral_enabled', spectralEnabledNotifier.value));
+  });
   themeModeNotifier.addListener(() {
     final v = switch (themeModeNotifier.value) {
       ThemeMode.light => 'light',
@@ -118,13 +135,13 @@ Future<void> _loadSettings() async {
 }
 
 /// 删除已下线功能的残留缓存文件（只跑一次，文件不存在则跳过）。
+/// 注意：scan_cache.json 不在此列——它是增量扫描的依据，不能删。
 Future<void> _cleanOrphanCaches() async {
   try {
     final dir = await getApplicationDocumentsDirectory();
     for (final name in [
       'acoustic_fp_cache.json', // 音频指纹（已移除）
       'spectrum_cache.json', // 假无损频谱检测（已移除）
-      'scan_cache.json', // 启动恢复扫描结果（已移除）
     ]) {
       final f = File('${dir.path}/$name');
       if (await f.exists()) {

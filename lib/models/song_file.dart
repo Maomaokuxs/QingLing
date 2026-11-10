@@ -1,6 +1,8 @@
 import 'dart:io';
 import 'dart:math';
 
+import '../services/spectral_analysis_service.dart';
+
 /// 单个音频文件模型
 class SongFile {
   final int id; // MediaStore id
@@ -30,6 +32,30 @@ class SongFile {
   /// 哈希值完全不同。跨格式识别靠 [SimilarityService] 的时长锚定层，
   /// 不要把本指纹当作"声音相似"来用。
   String fingerprint = '';
+
+  /// 频谱分析结果（假无损检测）：扫描后由 SimilarityService 填入，
+  /// null = 未分析。只对无损格式分析。
+  SpectralResult? spectral;
+
+  /// 疑似假无损：无损格式 + 频谱截止明显低于奈奎斯特。
+  /// 判定保守（比值 <0.85 才判假），边界不判。
+  bool get isFakeLossless =>
+      spectral != null &&
+      SpectralAnalysisService.isLosslessExt(extension) &&
+      spectral!.isFakeLossless;
+
+  /// 有效音质分：假无损按估算的真实码率 + MP3 格式分重算，
+  /// 不再享受无损格式加成；其余与 qualityScore 相同。
+  /// 自动勾选与排序用这个分，qualityScore 只保留"标称"值。
+  int get effectiveQualityScore {
+    if (!isFakeLossless) return qualityScore;
+    final est = spectral!.estimatedTrueBitrateKbps;
+    final bitrateScore = min(400, (est / 320 * 400).round());
+    return 200 + bitrateScore; // MP3 格式分 200
+  }
+
+  /// 有效音质标签：假无损按有效分重算标签。
+  String get effectiveQualityLabel => _labelForScore(effectiveQualityScore);
 
   SongFile({
     required this.id,
@@ -67,22 +93,32 @@ class SongFile {
         'realBitrateKbps': realBitrateKbps,
         'dateModified': dateModified,
         'fingerprint': fingerprint,
+        'spectralCutoffHz': spectral?.cutoffHz,
+        'spectralSampleRate': spectral?.sampleRate,
       };
 
-  factory SongFile.fromJson(Map<String, dynamic> j) => SongFile(
-        id: j['id'] as int,
-        path: j['path'] as String,
-        displayName: j['displayName'] as String,
-        title: j['title'] as String,
-        artist: j['artist'] as String,
-        album: j['album'] as String,
-        durationMs: j['durationMs'] as int,
-        sizeBytes: j['sizeBytes'] as int,
-        extension: j['extension'] as String,
-        realBitrateKbps: j['realBitrateKbps'] as int? ?? 0,
-        dateModified: j['dateModified'] as int? ?? 0,
-        fingerprint: j['fingerprint'] as String?,
-      );
+  factory SongFile.fromJson(Map<String, dynamic> j) {
+    final s = SongFile(
+      id: j['id'] as int,
+      path: j['path'] as String,
+      displayName: j['displayName'] as String,
+      title: j['title'] as String,
+      artist: j['artist'] as String,
+      album: j['album'] as String,
+      durationMs: j['durationMs'] as int,
+      sizeBytes: j['sizeBytes'] as int,
+      extension: j['extension'] as String,
+      realBitrateKbps: j['realBitrateKbps'] as int? ?? 0,
+      dateModified: j['dateModified'] as int? ?? 0,
+      fingerprint: j['fingerprint'] as String?,
+    );
+    final cutoff = (j['spectralCutoffHz'] as num?)?.toDouble();
+    final sr = (j['spectralSampleRate'] as num?)?.toInt();
+    if (cutoff != null && sr != null && cutoff > 0 && sr > 0) {
+      s.spectral = SpectralResult(cutoffHz: cutoff, sampleRate: sr);
+    }
+    return s;
+  }
 
   int _estimateBitrate() {
     if (durationMs <= 0 || sizeBytes <= 0) return 0;
@@ -115,17 +151,19 @@ class SongFile {
 
     int total = formatScore + bitrateScore; // 0 ~ 800
 
-    String label;
+    return (score: total, label: _labelForScore(total));
+  }
+
+  static String _labelForScore(int total) {
     if (total >= 700) {
-      label = '无损';
+      return '无损';
     } else if (total >= 500) {
-      label = '高音质';
+      return '高音质';
     } else if (total >= 350) {
-      label = '标准';
+      return '标准';
     } else {
-      label = '较差';
+      return '较差';
     }
-    return (score: total, label: label);
   }
 
   String get formattedSize {
