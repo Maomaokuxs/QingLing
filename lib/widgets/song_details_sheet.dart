@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 
 import '../models/song_file.dart';
 import '../services/audio_details_service.dart';
+import '../services/lyrico_service.dart';
 import 'minimal_ui.dart';
 
 /// 文件详情 BottomSheet：完整元数据。
@@ -13,6 +14,7 @@ Future<void> showSongDetailsSheet(
   SongFile s, {
   required VoidCallback onPreview,
   required bool playing,
+  VoidCallback? onLyricoSaved,
 }) {
   return showModalBottomSheet(
     context: context,
@@ -27,6 +29,7 @@ Future<void> showSongDetailsSheet(
         song: s,
         onPreview: onPreview,
         playing: playing,
+        onLyricoSaved: onLyricoSaved,
         scrollController: scrollController,
       ),
     ),
@@ -37,11 +40,13 @@ class _SongDetailsSheet extends StatefulWidget {
   final SongFile song;
   final VoidCallback onPreview;
   final bool playing;
+  final VoidCallback? onLyricoSaved;
   final ScrollController scrollController;
   const _SongDetailsSheet({
     required this.song,
     required this.onPreview,
     required this.playing,
+    this.onLyricoSaved,
     required this.scrollController,
   });
 
@@ -153,12 +158,67 @@ class _SongDetailsSheetState extends State<_SongDetailsSheet> {
                     },
                   ),
                 ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _pillButton(
+                    dark: false,
+                    icon: Icons.edit_rounded,
+                    label: 'Lyrico 编辑',
+                    onPressed: _openLyrico,
+                  ),
+                ),
               ],
             ),
           ),
         ],
       ),
     );
+  }
+
+  /// 用 Lyrico 外部编辑打开这首歌（改标签、歌词、封面）。
+  /// 保存返回后关掉详情页、通知主屏重扫（文件 mtime/size 已变，增量扫描会重读）；
+  /// 未保存退出什么都不做；没装 Lyrico 时弹安装提示。
+  /// 调起失败（通道异常）弹提示，不再静默无反应。
+  Future<void> _openLyrico() async {
+    late final LyricoEditResult result;
+    try {
+      result = await LyricoService.editSong(widget.song);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('打开 Lyrico 失败：$e')),
+      );
+      return;
+    }
+    if (!mounted) return;
+    switch (result) {
+      case LyricoEditResult.saved:
+        if (mounted) Navigator.pop(context);
+        widget.onLyricoSaved?.call();
+      case LyricoEditResult.cancelled:
+        break;
+      case LyricoEditResult.notInstalled:
+        final go = await showDialog<bool>(
+          context: context,
+          builder: (c) => AlertDialog(
+            title: const Text('未安装 Lyrico'),
+            content: const Text('编辑标签、歌词需要安装 Lyrico（开源免费），去 GitHub 下载吗？'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(c, false),
+                child: const Text('取消'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(c, true),
+                child: const Text('去下载'),
+              ),
+            ],
+          ),
+        );
+        if (go == true && mounted) {
+          await LyricoService.openUrl(LyricoService.releaseUrl);
+        }
+    }
   }
 
   /// 极简 pill 按钮：dark=true 黑底白字，dark=false 灰底深字。

@@ -2,6 +2,7 @@ package com.qingling.app
 
 import android.Manifest
 import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.BroadcastReceiver
 import android.content.ContentUris
 import android.content.Context
@@ -35,6 +36,9 @@ class MainActivity : FlutterActivity() {
     // MediaStore 删除请求被用户取消时，直接删除的部分已删，需如实返回
     private var pendingDirectDeleted: List<String> = emptyList()
     private val deleteRequestCode = 1001
+    // Lyrico 外部编辑的 requestCode 与待回传结果
+    private val editRequestCode = 1002
+    private var pendingEditResult: MethodChannel.Result? = null
     // 文件系统直扫认的音频扩展名（与 Dart 层 audioExts 保持一致）
     private val fsAudioExts = setOf(
         "mp3", "flac", "wav", "m4a", "aac", "ogg", "wma", "opus", "aiff", "mp2"
@@ -287,6 +291,22 @@ class MainActivity : FlutterActivity() {
                     val followRedirects = call.argument<Boolean>("followRedirects") ?: true
                     if (url != null) {
                         httpGet(url, followRedirects, result)
+                    } else {
+                        result.error("ARG_ERROR", "url null", null)
+                    }
+                } else if (call.method == "editWithLyrico") {
+                    val id = call.argument<Number>("id")?.toLong() ?: 0L
+                    val path = call.argument<String>("path")
+                    editWithLyrico(id, path, result)
+                } else if (call.method == "openUrl") {
+                    val url = call.argument<String>("url")
+                    if (url != null) {
+                        try {
+                            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("OPEN_URL_ERROR", e.message, null)
+                        }
                     } else {
                         result.error("ARG_ERROR", "url null", null)
                     }
@@ -1406,6 +1426,46 @@ class MainActivity : FlutterActivity() {
         super.onDestroy()
     }
 
+    /// 用 Lyrico 外部编辑打开一首歌（改标签、歌词、封面）。
+    /// action com.lonx.lyrico.action.EDIT_TAG，包名先试正式版 com.lonx.lyrico，
+    /// 未装再试 debug 版 com.lonx.lyrico.debug，都没有报 NOT_INSTALLED。
+    /// URI 用 MediaStore content URI（id>0 直接拼；id<=0 时按路径查 MediaStore）。
+    /// 结果经 onActivityResult 回传：保存返回 {saved: true, uri}，未保存 {saved: false}。
+    private fun editWithLyrico(id: Long, path: String?, result: MethodChannel.Result) {
+        var mediaId = id
+        if (mediaId <= 0 && path != null) {
+            val row = mediaStoreRowForPath(path)
+            mediaId = (row?.get("id") as? Number)?.toLong() ?: 0L
+        }
+        if (mediaId <= 0) {
+            result.error("NO_URI", "song not in MediaStore", null)
+            return
+        }
+        val uri = Uri.withAppendedPath(
+            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+            mediaId.toString(),
+        )
+        // 注意：不要给 MediaStore URI 加 FLAG_GRANT_*_URI_PERMISSION——清聆
+        // 靠 READ_MEDIA_AUDIO 读媒体库，没有单个 URI 的可转授权限，加了会在
+        // 发 Intent 时被系统以 SecurityException 拦下。Lyrico 自己会走
+        // READ_MEDIA_AUDIO（未授就弹系统授权）和 MediaStore.createWriteRequest
+        //（保存时弹系统确认）拿读写权，只传 URI 就够了。
+        val intent = Intent("com.lonx.lyrico.action.EDIT_TAG").apply {
+            setDataAndType(uri, "audio/*")
+        }
+        for (pkg in listOf("com.lonx.lyrico", "com.lonx.lyrico.debug")) {
+            try {
+                intent.setPackage(pkg)
+                startActivityForResult(intent, editRequestCode)
+                pendingEditResult = result
+                return
+            } catch (_: ActivityNotFoundException) {
+                // 换下一个包名再试
+            }
+        }
+        result.error("NOT_INSTALLED", "Lyrico not installed", null)
+    }
+
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == deleteRequestCode) {
@@ -1418,6 +1478,14 @@ class MainActivity : FlutterActivity() {
             pendingResult = null
             pendingDeletePaths = emptyList()
             pendingDirectDeleted = emptyList()
+        } else if (requestCode == editRequestCode) {
+            if (resultCode == Activity.RESULT_OK) {
+                val uri = data?.data?.toString() ?: ""
+                pendingEditResult?.success(mapOf("saved" to true, "uri" to uri))
+            } else {
+                pendingEditResult?.success(mapOf("saved" to false))
+            }
+            pendingEditResult = null
         }
     }
 }

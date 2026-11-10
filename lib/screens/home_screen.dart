@@ -694,6 +694,10 @@ class _HomeScreenState extends State<HomeScreen> {
       s,
       onPreview: () => _togglePreview(s),
       playing: _playingPath == s.path,
+      // Lyrico 保存后文件已改（mtime/size 变），增量扫描重读并重新分组
+      onLyricoSaved: () {
+        if (mounted && !scanning) _scan();
+      },
     );
   }
 
