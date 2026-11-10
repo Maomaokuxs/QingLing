@@ -1,4 +1,6 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 检查更新 / 下载 APK 用：无此权限建 socket 即报 Permission denied -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <!-- Android 13+ 媒体权限 / 兼容旧版本 -->
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />

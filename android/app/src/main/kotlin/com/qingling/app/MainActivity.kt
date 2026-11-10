@@ -22,6 +22,7 @@ import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import android.util.Log
 import android.net.Uri
+import java.net.URL
 import androidx.core.content.FileProvider
 import java.io.File
 import io.flutter.embedding.android.FlutterActivity
@@ -39,6 +40,8 @@ class MainActivity : FlutterActivity() {
         "mp3", "flac", "wav", "m4a", "aac", "ogg", "wma", "opus", "aiff", "mp2"
     )
     private var debugChannel: MethodChannel? = null
+    private var updateChannel: MethodChannel? = null
+    @Volatile private var downloadCancelled = false
     private val debugReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
@@ -87,6 +90,89 @@ class MainActivity : FlutterActivity() {
             Log.w("song_dedup", "installApk failed: ${e.message}")
             false
         }
+    }
+
+    /// 原生 HTTP GET（走 HttpURLConnection，用 Android 系统解析，能感知 VPN/Clash。
+    /// Dart 的 HttpClient 走 Bionic getaddrinfo，手机系统 DNS 为空时解析不到
+    /// github 域名，检查更新会报 Failed host lookup；原生这条路不受影响）。
+    /// [followRedirects] 为 false 时不跟随重定向，返回 Location 供上层取 tag。
+    /// 返回 map：status（Int）、location（String?）、body（String?）。
+    /// 网络异常时 result.error("HTTP_ERROR", "异常类名: 信息", null)。
+    private fun httpGet(url: String, followRedirects: Boolean, result: MethodChannel.Result) {
+        Thread {
+            try {
+                val conn = URL(url).openConnection() as java.net.HttpURLConnection
+                conn.instanceFollowRedirects = followRedirects
+                conn.connectTimeout = 10000
+                conn.readTimeout = 10000
+                conn.setRequestProperty("User-Agent", "QingLing")
+                conn.setRequestProperty("Accept", "application/vnd.github+json")
+                conn.requestMethod = "GET"
+                val status = conn.responseCode
+                val location = conn.getHeaderField("Location")
+                val stream = if (status in 200..299) conn.inputStream else conn.errorStream
+                val body = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                conn.disconnect()
+                val out = HashMap<String, Any?>()
+                out["status"] = status
+                out["location"] = location
+                out["body"] = body
+                result.success(out)
+            } catch (e: Exception) {
+                result.error("HTTP_ERROR", "${e.javaClass.simpleName}: ${e.message}", null)
+            }
+        }.start()
+    }
+
+    /// 原生下载文件（走 HttpURLConnection，跟随重定向）。
+    /// 进度经 updateChannel 回推 Dart（downloadProgress：received/total 字节，
+    /// total 为 -1 表示未知）；取消由 cancelDownload 置标志位，中断后删残文件。
+    /// 成功返回 destPath，失败 result.error。
+    private fun downloadFile(url: String, destPath: String, result: MethodChannel.Result) {
+        Thread {
+            try {
+                val conn = URL(url).openConnection() as java.net.HttpURLConnection
+                conn.instanceFollowRedirects = true
+                conn.connectTimeout = 10000
+                conn.readTimeout = 30000
+                conn.setRequestProperty("User-Agent", "QingLing")
+                conn.requestMethod = "GET"
+                val status = conn.responseCode
+                if (status != 200) {
+                    conn.disconnect()
+                    result.error("HTTP_ERROR", "下载失败：HTTP $status", null)
+                    return@Thread
+                }
+                val total = conn.contentLengthLong
+                val outFile = File(destPath)
+                var received = 0L
+                conn.inputStream.use { input ->
+                    outFile.outputStream().use { output ->
+                        val buf = ByteArray(8192)
+                        var n: Int
+                        while (input.read(buf).also { n = it } != -1) {
+                            if (downloadCancelled) {
+                                output.close()
+                                outFile.delete()
+                                conn.disconnect()
+                                result.error("CANCELLED", "已取消", null)
+                                return@Thread
+                            }
+                            output.write(buf, 0, n)
+                            received += n
+                            updateChannel?.invokeMethod(
+                                "downloadProgress",
+                                mapOf("received" to received, "total" to total),
+                            )
+                        }
+                    }
+                }
+                conn.disconnect()
+                result.success(destPath)
+            } catch (e: Exception) {
+                result.error("HTTP_ERROR", "${e.javaClass.simpleName}: ${e.message}", null)
+            }
+        }.start()
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -196,6 +282,14 @@ class MainActivity : FlutterActivity() {
                     } else {
                         result.error("ARG_ERROR", "path null", null)
                     }
+                } else if (call.method == "httpGet") {
+                    val url = call.argument<String>("url")
+                    val followRedirects = call.argument<Boolean>("followRedirects") ?: true
+                    if (url != null) {
+                        httpGet(url, followRedirects, result)
+                    } else {
+                        result.error("ARG_ERROR", "url null", null)
+                    }
                 } else {
                     result.notImplemented()
                 }
@@ -213,6 +307,26 @@ class MainActivity : FlutterActivity() {
                     result.notImplemented()
                 }
             }
+
+        // Update channel: 原生下载 APK（走 HttpURLConnection，与 httpGet 同理）。
+        updateChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "song_dedup/update")
+        updateChannel?.setMethodCallHandler { call, result ->
+            if (call.method == "downloadFile") {
+                val url = call.argument<String>("url")
+                val destPath = call.argument<String>("destPath")
+                if (url != null && destPath != null) {
+                    downloadCancelled = false
+                    downloadFile(url, destPath, result)
+                } else {
+                    result.error("ARG_ERROR", "url/destPath null", null)
+                }
+            } else if (call.method == "cancelDownload") {
+                downloadCancelled = true
+                result.success(true)
+            } else {
+                result.notImplemented()
+            }
+        }
     }
 
     /// 查询所有 .lrc 歌词文件（MediaStore.Files）

@@ -97,7 +97,23 @@ class UpdateService {
       'https://api.github.com/repos/Maomaokuxs/QingLing/releases/latest';
   static const _ch = MethodChannel('song_dedup/scanner');
 
+  /// 经原生 HttpURLConnection GET（走 Android 系统解析，能感知 VPN/Clash，
+  /// Dart 的 HttpClient 读不到系统 DNS 时解析失败）。
+  /// 返回 {status, location, body}；网络异常时抛 PlatformException。
+  static Future<Map<String, dynamic>> _nativeGet(
+    String url, {
+    bool followRedirects = true,
+  }) async {
+    final res = await _ch.invokeMethod<Map<dynamic, dynamic>>(
+      'httpGet',
+      {'url': url, 'followRedirects': followRedirects},
+    );
+    return Map<String, dynamic>.from(res ?? {});
+  }
+
   /// 查最新 release。网络超时 10 秒。
+  ///
+  /// 先走 api.github.com；网络失败时改走 github.com 网页重定向兜底。
   static Future<UpdateCheckResult> checkForUpdate() async {
     String current;
     try {
@@ -105,42 +121,108 @@ class UpdateService {
     } catch (_) {
       return const UpdateCheckResult(UpdateStatus.error, message: '无法读取当前版本');
     }
-    final client = HttpClient();
-    client.connectionTimeout = const Duration(seconds: 10);
     try {
-      final req = await client.getUrl(Uri.parse(_latestUrl));
-      req.headers.set('Accept', 'application/vnd.github+json');
-      req.headers.set('User-Agent', 'QingLing');
-      final resp = await req.close().timeout(const Duration(seconds: 10));
-      final body = await resp.transform(utf8.decoder).join();
-      if (resp.statusCode == 404) {
-        return const UpdateCheckResult(UpdateStatus.noReleases);
+      final apiResult = await _checkViaApi(current);
+      if (apiResult.status != UpdateStatus.error) {
+        return apiResult;
       }
-      if (resp.statusCode != 200) {
-        return UpdateCheckResult(
-          UpdateStatus.error,
-          message: '服务器返回 ${resp.statusCode}',
-        );
-      }
-      final raw = jsonDecode(body);
-      if (raw is! Map<String, dynamic>) {
-        return const UpdateCheckResult(UpdateStatus.error, message: '返回数据异常');
-      }
-      final info = UpdateInfo.fromReleaseJson(raw);
-      if (info == null) {
-        return const UpdateCheckResult(UpdateStatus.noReleases);
-      }
-      if (isNewerVersion(info.version, current)) {
-        return UpdateCheckResult(UpdateStatus.available, info: info);
-      }
-      return const UpdateCheckResult(UpdateStatus.upToDate);
-    } on TimeoutException {
-      return const UpdateCheckResult(UpdateStatus.error, message: '连接超时');
-    } catch (e) {
-      return UpdateCheckResult(UpdateStatus.error, message: e.toString());
-    } finally {
-      client.close();
+      // API 报错（如 403 限流）时也改走网页兜底；网页没有 API 的限流。
+      return _checkViaWeb(current);
+    } on PlatformException {
+      return _checkViaWeb(current);
     }
+  }
+
+  /// 走 GitHub API 查最新 release。网络异常（PlatformException）不吞，
+  /// 直接抛给上层兜底。
+  static Future<UpdateCheckResult> _checkViaApi(String current) async {
+    final res = await _nativeGet(_latestUrl);
+    final status = res['status'] as int? ?? 0;
+    final body = res['body'] as String? ?? '';
+    if (status == 404) {
+      return const UpdateCheckResult(UpdateStatus.noReleases);
+    }
+    if (status != 200) {
+      return UpdateCheckResult(
+        UpdateStatus.error,
+        message: '服务器返回 $status',
+      );
+    }
+    final raw = jsonDecode(body);
+    if (raw is! Map<String, dynamic>) {
+      return const UpdateCheckResult(UpdateStatus.error, message: '返回数据异常');
+    }
+    final info = UpdateInfo.fromReleaseJson(raw);
+    if (info == null) {
+      return const UpdateCheckResult(UpdateStatus.noReleases);
+    }
+    if (isNewerVersion(info.version, current)) {
+      return UpdateCheckResult(UpdateStatus.available, info: info);
+    }
+    return const UpdateCheckResult(UpdateStatus.upToDate);
+  }
+
+  /// 网页兜底：github.com/releases/latest 会 302 到最新 release 的 tag 页，
+  /// 从 Location 里取 tag；下载地址按发布命名规则拼。
+  /// 仅在 API 路径因网络失败时调用。
+  static const _webLatestUrl =
+      'https://github.com/Maomaokuxs/QingLing/releases/latest';
+
+  static Future<UpdateCheckResult> _checkViaWeb(String current) async {
+    Map<String, dynamic> res;
+    try {
+      res = await _nativeGet(_webLatestUrl, followRedirects: false);
+    } on PlatformException catch (e) {
+      return UpdateCheckResult(UpdateStatus.error, message: _nativeError(e));
+    }
+    final status = res['status'] as int? ?? 0;
+    if (status == 404) {
+      return const UpdateCheckResult(UpdateStatus.noReleases);
+    }
+    if (status != 302 && status != 301) {
+      return UpdateCheckResult(
+        UpdateStatus.error,
+        message: '服务器返回 $status',
+      );
+    }
+    final tag = tagFromLocation(res['location'] as String? ?? '');
+    if (tag.isEmpty) {
+      return const UpdateCheckResult(UpdateStatus.error, message: '返回数据异常');
+    }
+    final version = tag.startsWith('v') || tag.startsWith('V')
+        ? tag.substring(1)
+        : tag;
+    if (isNewerVersion(version, current)) {
+      return UpdateCheckResult(
+        UpdateStatus.available,
+        info: UpdateInfo(
+          tag: tag,
+          name: tag,
+          notes: '',
+          apkUrl:
+              'https://github.com/Maomaokuxs/QingLing/releases/download/$tag/QingLing-$version-arm64.apk',
+          apkSizeBytes: -1,
+        ),
+      );
+    }
+    return const UpdateCheckResult(UpdateStatus.upToDate);
+  }
+
+  /// 原生 HTTP 异常文案取短一点，去掉 "HTTP_ERROR: " 前缀与异常类名。
+  static String _nativeError(PlatformException e) {
+    final m = e.message ?? e.toString();
+    final idx = m.indexOf(': ');
+    return idx >= 0 ? m.substring(idx + 2) : m;
+  }
+
+  /// 从重定向 Location 取 tag，如
+  /// https://github.com/Maomaokuxs/QingLing/releases/tag/v0.2.1 → v0.2.1。
+  /// 相对地址也行。取不到返回 ''。
+  static String tagFromLocation(String location) {
+    if (location.isEmpty) return '';
+    final uri = Uri.tryParse(location);
+    if (uri == null || uri.pathSegments.isEmpty) return '';
+    return uri.pathSegments.last;
   }
 
   /// release 版本是否比当前新。只比 X.Y.Z，不比 build 号。
@@ -177,38 +259,42 @@ class UpdateService {
   }
 
   /// 下载 APK 到缓存目录，返回文件路径。
+  /// 走原生 HttpURLConnection（与检查更新同理，Dart HttpClient 解析不到）。
   /// [onProgress] 回调（已收字节，总字节；总字节未知时为 -1）。
-  /// 传入 [client] 时由调用方持有，可在取消时 client.close(force: true)
-  /// 中断下载；不传则内部新建。
+  /// 取消用 [cancelDownload]，不再传 HttpClient。
+  static const _updateCh = MethodChannel('song_dedup/update');
+
   static Future<String> downloadApk(
     String url,
-    void Function(int received, int total) onProgress, {
-    HttpClient? client,
-  }) async {
+    void Function(int received, int total) onProgress,
+  ) async {
     final dir = await getTemporaryDirectory();
     final file = File('${dir.path}/qingling-update.apk');
-    final httpClient = client ?? HttpClient();
-    httpClient.connectionTimeout = const Duration(seconds: 10);
-    try {
-      final req = await httpClient.getUrl(Uri.parse(url));
-      req.headers.set('User-Agent', 'QingLing');
-      final resp = await req.close();
-      if (resp.statusCode != 200) {
-        throw HttpException('下载失败：HTTP ${resp.statusCode}');
-      }
-      final total = resp.contentLength;
-      final sink = file.openWrite();
-      var received = 0;
-      await for (final chunk in resp) {
-        sink.add(chunk);
-        received += chunk.length;
+    _updateCh.setMethodCallHandler((call) async {
+      if (call.method == 'downloadProgress') {
+        final args = call.arguments as Map<dynamic, dynamic>;
+        final received = (args['received'] as num?)?.toInt() ?? 0;
+        final total = (args['total'] as num?)?.toInt() ?? -1;
         onProgress(received, total);
       }
-      await sink.close();
-      return file.path;
+    });
+    try {
+      final path = await _updateCh.invokeMethod<String>(
+        'downloadFile',
+        {'url': url, 'destPath': file.path},
+      );
+      if (path == null || path.isEmpty) throw Exception('下载失败');
+      return path;
     } finally {
-      if (client == null) httpClient.close();
+      _updateCh.setMethodCallHandler(null);
     }
+  }
+
+  /// 取消正在进行的原生下载。
+  static Future<void> cancelDownload() async {
+    try {
+      await _updateCh.invokeMethod<bool>('cancelDownload');
+    } catch (_) {}
   }
 
   /// 调原生安装器安装指定 APK。返回是否成功调起安装界面。

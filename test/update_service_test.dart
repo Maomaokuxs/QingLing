@@ -104,4 +104,27 @@ void main() {
       expect(info.apkSizeBytes, 999);
     });
   });
+
+  group('UpdateService.tagFromLocation 网页重定向取 tag', () {
+    test('完整地址取最后一段', () {
+      expect(
+        UpdateService.tagFromLocation(
+            'https://github.com/Maomaokuxs/QingLing/releases/tag/v0.2.1'),
+        'v0.2.1',
+      );
+    });
+
+    test('相对地址也能取', () {
+      expect(
+        UpdateService.tagFromLocation(
+            '/Maomaokuxs/QingLing/releases/tag/v0.3.0'),
+        'v0.3.0',
+      );
+    });
+
+    test('空串与非法地址返回空串', () {
+      expect(UpdateService.tagFromLocation(''), '');
+      expect(UpdateService.tagFromLocation('not a url ://'), '');
+    });
+  });
 }

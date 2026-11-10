@@ -19,9 +19,11 @@ import '../services/scan_history_service.dart';
 import '../services/share_service.dart';
 import '../services/similarity_service.dart';
 import '../services/trash_service.dart';
+import '../services/update_service.dart';
 import '../widgets/group_card.dart';
 import '../widgets/minimal_ui.dart';
 import '../widgets/song_details_sheet.dart';
+import '../widgets/update_prompt.dart';
 import 'settings_screen.dart';
 import 'trash_screen.dart';
 
@@ -60,6 +62,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void initState() {
     super.initState();
     _maybeAutoScan();
+    _maybeCheckUpdateOnStartup();
     _player.onPlayerComplete.listen((_) {
       _playProgress.value = 0;
       if (mounted) setState(() => _playingPath = null);
@@ -287,6 +290,22 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   /// 启动时：若开启自动扫描且距离上次扫描超过设定天数，则自动扫描
+  /// 启动时检查更新（开关默认开）：首帧后静默查一次，有新版才弹提示，
+  /// 已是最新 / 无 release / 检查失败都不打扰。
+  void _maybeCheckUpdateOnStartup() {
+    if (!updateCheckOnStartupNotifier.value) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      try {
+        final result = await UpdateService.checkForUpdate();
+        if (!mounted) return;
+        if (result.status == UpdateStatus.available && result.info != null) {
+          showUpdatePrompt(context, result.info!);
+        }
+      } catch (_) {}
+    });
+  }
+
   Future<void> _maybeAutoScan() async {
     if (!autoScanNotifier.value) return;
     try {

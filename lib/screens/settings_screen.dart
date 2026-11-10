@@ -128,6 +128,7 @@ class SettingsScreen extends StatelessWidget {
                   _SectionHeader(title: '关于'),
                   _MinimalCard(
                     children: [
+                      _updateCheckRow(),
                       FutureBuilder<String>(
                         future: AppVersion.get(),
                         builder: (context, snap) => _Row(
@@ -338,6 +339,24 @@ class SettingsScreen extends StatelessWidget {
         trailing: MinimalSwitch(
           value: enabled,
           onChanged: (v) => spectralEnabledNotifier.value = v,
+        ),
+      ),
+    );
+  }
+
+  /// 启动时检查更新开关：默认开启。打开后每次启动自动查一次 GitHub 最新
+  /// release，有新版弹更新提示；关闭则启动时不检查、不提示，仍可在关于页手动查。
+  Widget _updateCheckRow() {
+    return ValueListenableBuilder<bool>(
+      valueListenable: updateCheckOnStartupNotifier,
+      builder: (context, enabled, _) => _Row(
+        title: '启动时检查更新',
+        subtitle: enabled
+            ? '已开启：启动时自动查新版，有新版弹更新提示'
+            : '已关闭：启动时不检查更新，可在关于页手动检查',
+        trailing: MinimalSwitch(
+          value: enabled,
+          onChanged: (v) => updateCheckOnStartupNotifier.value = v,
         ),
       ),
     );

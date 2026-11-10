@@ -35,6 +35,8 @@ final ValueNotifier<bool> autoScanNotifier = ValueNotifier(false);
 final ValueNotifier<int> autoScanDaysNotifier = ValueNotifier(7);
 /// 回收站自动清理：超过 N 天的记录自动删除，0=永不
 final ValueNotifier<int> trashRetentionDaysNotifier = ValueNotifier(30);
+/// 启动时检查更新：默认开启。有新版时启动后弹更新提示；关闭则不检查、不提示。
+final ValueNotifier<bool> updateCheckOnStartupNotifier = ValueNotifier(true);
 
 Future<void> _loadSettings() async {
   final prefs = await SharedPreferences.getInstance();
@@ -88,6 +90,8 @@ Future<void> _loadSettings() async {
   if (asd == 7 || asd == 14 || asd == 30) autoScanDaysNotifier.value = asd!;
   final tr = prefs.getInt('trash_retention_days');
   if (tr != null && tr >= 0) trashRetentionDaysNotifier.value = tr;
+  updateCheckOnStartupNotifier.value =
+      prefs.getBool('update_check_on_startup') ?? true;
   fingerprintEnabledNotifier.addListener(() {
     SharedPreferences.getInstance().then((p) => p.setBool('fingerprint_enabled', fingerprintEnabledNotifier.value));
   });
@@ -131,6 +135,9 @@ Future<void> _loadSettings() async {
   });
   trashRetentionDaysNotifier.addListener(() {
     SharedPreferences.getInstance().then((p) => p.setInt('trash_retention_days', trashRetentionDaysNotifier.value));
+  });
+  updateCheckOnStartupNotifier.addListener(() {
+    SharedPreferences.getInstance().then((p) => p.setBool('update_check_on_startup', updateCheckOnStartupNotifier.value));
   });
 }
 
